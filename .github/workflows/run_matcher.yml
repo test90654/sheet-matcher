@@ -2,8 +2,8 @@ name: Sheet Matcher Automation
 
 on:
   schedule:
-    - cron: '0 23 * * *'  # 毎日日本時間 8:00 (UTC 23:00) に自動実行
-  workflow_dispatch:      # GitHubの画面から手動でもボタン一つで実行できるようにする
+    - cron: '0 23 * * *'  # 毎日日本時間 8:00
+  workflow_dispatch:
 
 jobs:
   run-python-script:
@@ -21,12 +21,9 @@ jobs:
         run: |
           pip install gspread pandas rapidfuzz google-auth
 
-      - name: Create credentials.json from GitHub Secrets
-        run: |
-          echo "${{ secrets.GCP_SA_KEY }}" > credentials.json
-
       - name: Run script
         env:
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
           MASTER_SHEET_ID: ${{ secrets.MASTER_SHEET_ID }}
           PRICE_SHEET_ID: ${{ secrets.PRICE_SHEET_ID }}
         run: |
