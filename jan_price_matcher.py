@@ -1,21 +1,26 @@
 import os
+import json
 import re
 import gspread
 from google.oauth2.service_account import Credentials
 import pandas as pd
 from rapidfuzz import fuzz, process
 
-# 環境変数から認証情報とスプレッドシートIDを取得
+# GitHub Secretsの環境変数からサービスアカウントのJSON文字列を取得
+sa_key_json = os.environ.get("GCP_SA_KEY")
+if not sa_key_json:
+    raise ValueError("環境変数 GCP_SA_KEY が設定されていません。")
+
+# プレーンテキストのJSON文字列から認証情報を直接構築
+sa_info = json.loads(sa_key_json)
 SCOPES = [
     'https://www.googleapis.com/auth/spreadsheets',
     'https://www.googleapis.com/auth/drive'
 ]
-
-CREDENTIALS_FILE = 'credentials.json'
-creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SCOPES)
+creds = Credentials.from_service_account_info(sa_info, scopes=SCOPES)
 gc = gspread.authorize(creds)
 
-# GitHub SecretsからIDを取得（ローカルテスト用フォールバック付き）
+# スプレッドシートIDの取得
 MASTER_ID = os.environ.get("MASTER_SHEET_ID")
 PRICE_ID = os.environ.get("PRICE_SHEET_ID")
 
