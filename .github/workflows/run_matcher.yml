@@ -1,0 +1,33 @@
+name: Sheet Matcher Automation
+
+on:
+  schedule:
+    - cron: '0 23 * * *'  # 毎日日本時間 8:00 (UTC 23:00) に自動実行
+  workflow_dispatch:      # GitHubの画面から手動でもボタン一つで実行できるようにする
+
+jobs:
+  run-python-script:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install gspread pandas rapidfuzz google-auth
+
+      - name: Create credentials.json from GitHub Secrets
+        run: |
+          echo "${{ secrets.GCP_SA_KEY }}" > credentials.json
+
+      - name: Run script
+        env:
+          MASTER_SHEET_ID: ${{ secrets.MASTER_SHEET_ID }}
+          PRICE_SHEET_ID: ${{ secrets.PRICE_SHEET_ID }}
+        run: |
+          python jan_price_matcher.py
