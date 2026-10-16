@@ -4,6 +4,13 @@ on:
   schedule:
     - cron: '0 23 * * *'  # 毎日日本時間 8:00
   workflow_dispatch:
+    inputs:
+      match_threshold:
+        description: 'あいまい一致として採用する類似度（%）'
+        default: '95'
+      review_threshold:
+        description: '要確認として候補を出す類似度（%）'
+        default: '85'
 
 jobs:
   run-python-script:
@@ -26,5 +33,7 @@ jobs:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
           MASTER_SHEET_ID: ${{ secrets.MASTER_SHEET_ID }}
           PRICE_SHEET_ID: ${{ secrets.PRICE_SHEET_ID }}
+          MATCH_THRESHOLD: ${{ inputs.match_threshold || '95' }}
+          REVIEW_THRESHOLD: ${{ inputs.review_threshold || '85' }}
         run: |
           python jan_price_matcher.py
