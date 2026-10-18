@@ -59,6 +59,8 @@ def match_dataframes(df_master, df_price, threshold=MATCH_THRESHOLD, review_thre
     merged_df['類似度'] = ''
     merged_df['価格表側の商品名'] = ''
     merged_df['要確認_候補価格'] = ''
+    # pandas 3 では '' で作った列が文字列専用型になり数値の価格を代入できないため、object型にそろえる
+    merged_df = merged_df.astype(object)
 
     master_names = merged_df[master_name_col].astype(str).str.strip()
     master_cleaned = master_names.map(clean_text)
