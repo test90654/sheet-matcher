@@ -234,11 +234,13 @@ def save_manual(sh, manual, merged_df, jan_col, master_name_col):
     overwrite_tab(sh, MANUAL_SHEET_NAME, data)
 
 
-def write_price_list(sh, df_price, price_name_col):
-    """プルダウンの選択肢として、価格表の商品名をマスター側のタブにコピーする
+def write_price_list(sh, df_price, price_name_col, price_col):
+    """プルダウンと検索サイドバーの選択肢として、価格表の商品名と価格をマスター側のタブにコピーする
     （入力規則では別のスプレッドシートの範囲を参照できないため）"""
-    names = list(dict.fromkeys(n for n in df_price[price_name_col].astype(str).str.strip() if n))
-    overwrite_tab(sh, LIST_SHEET_NAME, [['価格表の商品名']] + [[NO_MATCH]] + [[n] for n in names])
+    # 突合と同じく、同じ商品名が複数あれば最後の行の価格を使う
+    prices = dict(zip(df_price[price_name_col].astype(str).str.strip(), df_price[price_col]))
+    rows = [[n, '' if pd.isna(p) else str(p)] for n, p in prices.items() if n]
+    overwrite_tab(sh, LIST_SHEET_NAME, [['価格表の商品名', '買取価格'], [NO_MATCH, '']] + rows)
 
 
 def write_result(sh, merged_df):
@@ -276,14 +278,14 @@ def execute_sheet_matching(master_sheet_id, price_sheet_id, threshold=MATCH_THRE
     print(f"マスターデータ件数: {len(df_master)}件")
     print(f"買取価格表件数: {len(df_price)}件")
 
-    jan_col, master_name_col, price_name_col, _ = find_columns(df_master, df_price)
+    jan_col, master_name_col, price_name_col, price_col = find_columns(df_master, df_price)
     manual = load_manual(master_sh, jan_col, master_name_col)
 
     merged_df = match_dataframes(df_master, df_price, threshold, review_threshold, manual)
 
     # 結果タブを上書きする前に、取り込んだ手動指定を保存しておく
     save_manual(master_sh, manual, merged_df, jan_col, master_name_col)
-    write_price_list(master_sh, df_price, price_name_col)
+    write_price_list(master_sh, df_price, price_name_col, price_col)
     write_result(master_sh, merged_df)
     print("すべての処理が完了しました！")
 
