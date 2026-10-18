@@ -16,6 +16,11 @@ MATCH_THRESHOLD = float(os.environ.get("MATCH_THRESHOLD", 95))
 REVIEW_THRESHOLD = float(os.environ.get("REVIEW_THRESHOLD", 85))
 
 OUTPUT_SHEET_NAME = '突合結果_自動出力'
+# 手動指定の保存先と、プルダウンの選択肢に使う価格表の商品名リスト
+MANUAL_SHEET_NAME = '手動対応表'
+LIST_SHEET_NAME = '価格表_商品名リスト'
+MANUAL_COL = '手動指定'
+NO_MATCH = '(一致させない)'
 
 # あいまい一致を一度に計算する行数（メモリ使用量の上限を抑えるため）
 FUZZY_CHUNK_SIZE = 1000
@@ -46,11 +51,24 @@ def clean_text(text):
     return text.lower()
 
 
-def match_dataframes(df_master, df_price, threshold=MATCH_THRESHOLD, review_threshold=REVIEW_THRESHOLD):
-    """マスターと価格表を突合し、結果のDataFrameを返す"""
+def find_columns(df_master, df_price):
+    """JAN列・商品名列・価格列を列名から推定する"""
+    jan_col = next((c for c in df_master.columns if 'JAN' in c or 'バーコード' in c), None)
     master_name_col = next((c for c in df_master.columns if '商品名' in c), df_master.columns[1] if len(df_master.columns) > 1 else df_master.columns[0])
     price_name_col = next((c for c in df_price.columns if '商品名' in c), df_price.columns[1] if len(df_price.columns) > 1 else df_price.columns[0])
     price_col = next((c for c in df_price.columns if '価格' in c or '買取' in c), df_price.columns[-1])
+    return jan_col, master_name_col, price_name_col, price_col
+
+
+def make_key(jan, name):
+    """手動指定のキー：JANがあればJAN、なければ商品名"""
+    jan = '' if jan is None or pd.isna(jan) else str(jan).strip()
+    return jan or str(name).strip()
+
+
+def match_dataframes(df_master, df_price, threshold=MATCH_THRESHOLD, review_threshold=REVIEW_THRESHOLD, manual=None):
+    """マスターと価格表を突合し、結果のDataFrameを返す（manual: キー→価格表側の商品名 の手動指定）"""
+    jan_col, master_name_col, price_name_col, price_col = find_columns(df_master, df_price)
 
     merged_df = df_master.copy()
     if price_col not in merged_df.columns:
@@ -59,6 +77,8 @@ def match_dataframes(df_master, df_price, threshold=MATCH_THRESHOLD, review_thre
     merged_df['類似度'] = ''
     merged_df['価格表側の商品名'] = ''
     merged_df['要確認_候補価格'] = ''
+    keys = pd.Series([make_key(j, n) for j, n in zip(merged_df[jan_col] if jan_col else [None] * len(merged_df), merged_df[master_name_col])], index=merged_df.index)
+    merged_df[MANUAL_COL] = keys.map(manual or {}).fillna('')
     # pandas 3 では '' で作った列が文字列専用型になり数値の価格を代入できないため、object型にそろえる
     merged_df = merged_df.astype(object)
 
@@ -67,13 +87,29 @@ def match_dataframes(df_master, df_price, threshold=MATCH_THRESHOLD, review_thre
     price_names = df_price[price_name_col].astype(str).str.strip()
     price_cleaned = price_names.map(clean_text)
     price_values = df_price[price_col]
+    price_dict = dict(zip(price_names, price_values))
+
+    # 0. 手動指定（自動突合より優先し、以降の自動突合の対象から外す）
+    manual_vals = merged_df[MANUAL_COL].astype(str).str.strip()
+    locked = manual_vals != ''
+    if locked.any():
+        print(f"手動指定 {locked.sum()} 件を反映しています...")
+        no = manual_vals == NO_MATCH
+        merged_df.loc[no, '一致方法'] = '手動: 一致させない'
+        found = locked & ~no & manual_vals.isin(price_dict.keys())
+        merged_df.loc[found, price_col] = manual_vals[found].map(price_dict)
+        merged_df.loc[found, '一致方法'] = '手動指定'
+        merged_df.loc[found, '価格表側の商品名'] = manual_vals[found]
+        missing = locked & ~no & ~found
+        merged_df.loc[missing, '一致方法'] = '手動指定 (価格表に見つかりません)'
+        if missing.any():
+            print(f"  価格表に見つからない手動指定: {missing.sum()}件")
 
     def is_unmatched():
-        return merged_df[price_col].isna() | (merged_df[price_col] == '')
+        return (merged_df[price_col].isna() | (merged_df[price_col] == '')) & ~locked
 
     # 1. 完全一致
     print("商品名による完全一致処理を実行中...")
-    price_dict = dict(zip(price_names, price_values))
     hit = is_unmatched() & (master_names != '') & master_names.isin(price_dict.keys())
     merged_df.loc[hit, price_col] = master_names[hit].map(price_dict)
     merged_df.loc[hit, '一致方法'] = '商品名による完全一致'
@@ -130,23 +166,98 @@ def match_dataframes(df_master, df_price, threshold=MATCH_THRESHOLD, review_thre
     return merged_df
 
 
-def write_result(sh, merged_df):
-    """結果タブを削除せずに中身だけ上書きする（参照・書式・フィルタを保持）"""
-    merged_df = merged_df.fillna('').astype(str)
-    data_to_write = [merged_df.columns.tolist()] + merged_df.values.tolist()
+def overwrite_tab(sh, title, data_to_write):
+    """タブを削除せずに中身だけ上書きする（参照・書式・フィルタを保持）。なければ作成する"""
     rows, cols = len(data_to_write), len(data_to_write[0])
-
     try:
-        ws = sh.worksheet(OUTPUT_SHEET_NAME)
-        print(f"既存のタブ「{OUTPUT_SHEET_NAME}」の内容を上書きしています...")
+        ws = sh.worksheet(title)
+        print(f"既存のタブ「{title}」の内容を上書きしています...")
         ws.clear()
         if ws.row_count < rows or ws.col_count < cols:
             ws.resize(rows=max(ws.row_count, rows), cols=max(ws.col_count, cols))
     except gspread.exceptions.WorksheetNotFound:
-        print(f"新しいタブ「{OUTPUT_SHEET_NAME}」を作成して書き込んでいます...")
-        ws = sh.add_worksheet(title=OUTPUT_SHEET_NAME, rows=rows + 10, cols=cols + 5)
+        print(f"新しいタブ「{title}」を作成して書き込んでいます...")
+        ws = sh.add_worksheet(title=title, rows=rows + 10, cols=cols + 5)
 
     ws.update(range_name='A1', values=data_to_write)
+    return ws
+
+
+def read_tab(sh, title):
+    """タブの全セルを文字列で読む（タブがなければ空リスト）"""
+    try:
+        return sh.worksheet(title).get_all_values()
+    except gspread.exceptions.WorksheetNotFound:
+        return []
+
+
+def load_manual(sh, jan_col, master_name_col):
+    """手動対応表を読み、前回の結果タブの「手動指定」列での変更を反映した 手動指定の辞書を返す"""
+    manual = {}
+    for row in read_tab(sh, MANUAL_SHEET_NAME)[1:]:
+        if len(row) >= 3 and row[0].strip() and row[2].strip():
+            manual[row[0].strip()] = row[2].strip()
+
+    # 結果タブの「手動指定」列は手動対応表の内容で毎回埋めて出力しているので、
+    # 入力されていれば登録・変更、空になっていれば削除として扱う
+    values = read_tab(sh, OUTPUT_SHEET_NAME)
+    if values and MANUAL_COL in values[0]:
+        header = values[0]
+        mi = header.index(MANUAL_COL)
+        ji = header.index(jan_col) if jan_col in header else None
+        ni = header.index(master_name_col) if master_name_col in header else None
+        if ni is not None:
+            before = dict(manual)
+            for row in values[1:]:
+                row = row + [''] * (len(header) - len(row))
+                key = make_key(row[ji] if ji is not None else None, row[ni])
+                if not key:
+                    continue
+                v = row[mi].strip()
+                if v:
+                    manual[key] = v
+                else:
+                    manual.pop(key, None)
+            added = sum(1 for k in manual if before.get(k) != manual[k])
+            removed = sum(1 for k in before if k not in manual)
+            print(f"結果タブの手動指定を取り込みました（登録・変更: {added}件 / 削除: {removed}件）")
+    return manual
+
+
+def save_manual(sh, manual, merged_df, jan_col, master_name_col):
+    """手動指定を手動対応表タブに保存する（次回以降の実行でも引き継ぐため）"""
+    names = {}
+    for j, n in zip(merged_df[jan_col] if jan_col else [None] * len(merged_df), merged_df[master_name_col]):
+        names.setdefault(make_key(j, n), str(n))
+    data = [['キー(JANまたは商品名)', 'マスター商品名', '価格表側の商品名']]
+    data += [[k, names.get(k, ''), v] for k, v in sorted(manual.items())]
+    overwrite_tab(sh, MANUAL_SHEET_NAME, data)
+
+
+def write_price_list(sh, df_price, price_name_col):
+    """プルダウンの選択肢として、価格表の商品名をマスター側のタブにコピーする
+    （入力規則では別のスプレッドシートの範囲を参照できないため）"""
+    names = list(dict.fromkeys(n for n in df_price[price_name_col].astype(str).str.strip() if n))
+    overwrite_tab(sh, LIST_SHEET_NAME, [['価格表の商品名']] + [[NO_MATCH]] + [[n] for n in names])
+
+
+def write_result(sh, merged_df):
+    """結果タブを上書きし、「手動指定」列に価格表の商品名のプルダウンを付ける"""
+    merged_df = merged_df.fillna('').astype(str)
+    data_to_write = [merged_df.columns.tolist()] + merged_df.values.tolist()
+    ws = overwrite_tab(sh, OUTPUT_SHEET_NAME, data_to_write)
+
+    ci = merged_df.columns.get_loc(MANUAL_COL)
+    sh.batch_update({'requests': [{'setDataValidation': {
+        'range': {'sheetId': ws.id, 'startRowIndex': 1, 'endRowIndex': len(data_to_write),
+                  'startColumnIndex': ci, 'endColumnIndex': ci + 1},
+        'rule': {
+            'condition': {'type': 'ONE_OF_RANGE', 'values': [{'userEnteredValue': f"='{LIST_SHEET_NAME}'!$A$2:$A"}]},
+            'showCustomUi': True,
+            # 価格表から消えた商品名が残っていても警告表示にとどめる
+            'strict': False,
+        },
+    }}]})
 
 
 def execute_sheet_matching(master_sheet_id, price_sheet_id, threshold=MATCH_THRESHOLD, review_threshold=REVIEW_THRESHOLD):
@@ -165,7 +276,14 @@ def execute_sheet_matching(master_sheet_id, price_sheet_id, threshold=MATCH_THRE
     print(f"マスターデータ件数: {len(df_master)}件")
     print(f"買取価格表件数: {len(df_price)}件")
 
-    merged_df = match_dataframes(df_master, df_price, threshold, review_threshold)
+    jan_col, master_name_col, price_name_col, _ = find_columns(df_master, df_price)
+    manual = load_manual(master_sh, jan_col, master_name_col)
+
+    merged_df = match_dataframes(df_master, df_price, threshold, review_threshold, manual)
+
+    # 結果タブを上書きする前に、取り込んだ手動指定を保存しておく
+    save_manual(master_sh, manual, merged_df, jan_col, master_name_col)
+    write_price_list(master_sh, df_price, price_name_col)
     write_result(master_sh, merged_df)
     print("すべての処理が完了しました！")
 
