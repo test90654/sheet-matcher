@@ -31,8 +31,8 @@ jobs:
       - name: Run script
         env:
           GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
-          MASTER_SHEET_ID: ${{ secrets.MASTER_SHEET_ID }}
-          PRICE_SHEET_ID: ${{ secrets.PRICE_SHEET_ID }}
+          MASTER_SHEET_ID: ${{ secrets.MASTER_ID }}
+          PRICE_SHEET_ID: ${{ secrets.PRICE_ID }}
           MATCH_THRESHOLD: ${{ inputs.match_threshold || '95' }}
           REVIEW_THRESHOLD: ${{ inputs.review_threshold || '85' }}
         run: |
