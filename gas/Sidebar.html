@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html>
+<head>
+<base target="_top">
+<style>
+  body { font-family: Arial, 'Hiragino Sans', 'Meiryo', sans-serif; font-size: 13px; margin: 0; padding: 12px; color: #202124; }
+  .ctx { background: #f1f3f4; border-radius: 6px; padding: 8px 10px; margin-bottom: 10px; line-height: 1.5; }
+  .ctx .label { color: #5f6368; font-size: 11px; }
+  .ctx .name { font-weight: bold; word-break: break-all; }
+  .ctx.warn { background: #fef7e0; }
+  input[type=text] { width: 100%; box-sizing: border-box; padding: 8px; font-size: 14px; border: 1px solid #dadce0; border-radius: 4px; }
+  input[type=text]:focus { outline: 2px solid #1a73e8; border-color: transparent; }
+  .opts { display: flex; justify-content: space-between; align-items: center; margin: 6px 0; color: #5f6368; font-size: 12px; }
+  .actions { display: flex; gap: 6px; margin-bottom: 8px; }
+  .actions button { flex: 1; }
+  button { padding: 6px 8px; border: 1px solid #dadce0; background: #fff; border-radius: 4px; cursor: pointer; font-size: 12px; }
+  button:hover { background: #f1f3f4; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li { display: flex; justify-content: space-between; gap: 8px; padding: 7px 8px; border-bottom: 1px solid #eee; cursor: pointer; }
+  li:hover, li.active { background: #e8f0fe; }
+  li .n { word-break: break-all; }
+  li .p { white-space: nowrap; color: #188038; }
+  li.cand .n::before { content: '候補 '; color: #b06000; font-size: 11px; }
+  .status { min-height: 18px; margin-top: 8px; font-size: 12px; color: #188038; }
+  .status.error { color: #d93025; }
+</style>
+</head>
+<body>
+  <div id="ctx" class="ctx warn">読み込み中...</div>
+  <input id="q" type="text" placeholder="型番や商品名の一部（スペース区切りで絞り込み）" autocomplete="off">
+  <div class="opts">
+    <span id="count"></span>
+    <label><input id="next" type="checkbox" checked> 指定後に次の行へ</label>
+  </div>
+  <div class="actions">
+    <button id="nomatch">一致させない</button>
+    <button id="clear">指定を外す</button>
+  </div>
+  <ul id="list"></ul>
+  <div id="status" class="status"></div>
+
+<script>
+const NO_MATCH = '(一致させない)';
+const MAX_RESULTS = 100;
+let items = [];      // {name, price, norm}
+let ctx = null;      // 選択中の行
+let shown = [];      // 表示中の候補
+let activeIndex = 0;
+let polling = false;
+
+const $ = id => document.getElementById(id);
+
+// jan_price_matcher.py の clean_text と同じ考え方の正規化（全角半角・大文字小文字・スペースや記号の違いを無視）
+function norm(s) {
+  return String(s).normalize('NFKC').toLowerCase().replace(/[\s\-ー‐－―()（）\[\]【】]/g, '');
+}
+
+// 商品名から型番らしい部分（英数字で数字を含む最長の語）を取り出し、検索欄の初期値にする
+function guessQuery(name) {
+  const tokens = String(name).normalize('NFKC').match(/[A-Za-z0-9][A-Za-z0-9\-]*/g) || [];
+  const withDigit = tokens.filter(t => /\d/.test(t) && t.length >= 3);
+  return withDigit.sort((a, b) => b.length - a.length)[0] || '';
+}
+
+function search(q) {
+  const terms = q.split(/\s+/).map(norm).filter(Boolean);
+  const cand = ctx && ctx.ok ? ctx.candidate : '';
+  if (!terms.length) return items.filter(it => it.name === cand);
+  const hits = items.filter(it => terms.every(t => it.norm.includes(t)));
+  hits.sort((a, b) =>
+    (b.name === cand) - (a.name === cand) ||
+    a.norm.indexOf(terms[0]) - b.norm.indexOf(terms[0]) ||
+    a.norm.length - b.norm.length);
+  return hits;
+}
+
+function render() {
+  const hits = search($('q').value);
+  shown = hits.slice(0, MAX_RESULTS);
+  activeIndex = Math.min(activeIndex, Math.max(shown.length - 1, 0));
+  $('count').textContent = $('q').value.trim()
+    ? `${hits.length}件${hits.length > MAX_RESULTS ? `（上位${MAX_RESULTS}件を表示）` : ''}`
+    : '検索語を入力してください';
+  const list = $('list');
+  list.textContent = '';
+  shown.forEach((it, i) => {
+    const li = document.createElement('li');
+    if (ctx && ctx.ok && it.name === ctx.candidate) li.classList.add('cand');
+    if (i === activeIndex) li.classList.add('active');
+    const n = document.createElement('span'); n.className = 'n'; n.textContent = it.name;
+    const p = document.createElement('span'); p.className = 'p'; p.textContent = it.price ? `¥${Number(it.price).toLocaleString()}` : '';
+    if (it.price && isNaN(Number(it.price))) p.textContent = it.price;
+    li.append(n, p);
+    li.onclick = () => apply(it.name);
+    list.appendChild(li);
+  });
+}
+
+function renderContext() {
+  const box = $('ctx');
+  box.textContent = '';
+  box.classList.toggle('warn', !ctx || !ctx.ok);
+  if (!ctx || !ctx.ok) { box.textContent = ctx ? ctx.message : '読み込み中...'; return; }
+  const add = (cls, text) => { const d = document.createElement('div'); d.className = cls; d.textContent = text; box.appendChild(d); };
+  add('label', `${ctx.row}行目`);
+  add('name', ctx.name || '（商品名なし）');
+  add('label', `一致方法: ${ctx.method || '-'}`);
+  if (ctx.manual) add('label', `現在の手動指定: ${ctx.manual}`);
+}
+
+function setStatus(text, isError) {
+  $('status').textContent = text;
+  $('status').classList.toggle('error', !!isError);
+}
+
+function apply(value) {
+  if (!ctx || !ctx.ok) { setStatus('先に「突合結果_自動出力」タブの行を選択してください。', true); return; }
+  const row = ctx.row;
+  setStatus('書き込み中...');
+  google.script.run
+    .withSuccessHandler(() => {
+      setStatus(value === '' ? `${row}行目の指定を外しました。` : `${row}行目に「${value}」を指定しました。`);
+      poll();
+    })
+    .withFailureHandler(e => setStatus(e.message, true))
+    .setManual(row, value, $('next').checked);
+}
+
+function poll() {
+  if (polling) return;
+  polling = true;
+  google.script.run
+    .withSuccessHandler(c => {
+      polling = false;
+      const changed = !ctx || c.ok !== ctx.ok || c.row !== ctx.row;
+      const updated = changed || (c.ok && (c.manual !== ctx.manual || c.method !== ctx.method));
+      ctx = c;
+      if (updated) renderContext();
+      if (changed && c.ok) {
+        $('q').value = guessQuery(c.name);
+        activeIndex = 0;
+        render();
+      }
+    })
+    .withFailureHandler(() => { polling = false; })
+    .getContext();
+}
+
+$('q').addEventListener('input', () => { activeIndex = 0; render(); });
+$('q').addEventListener('keydown', e => {
+  if (e.key === 'ArrowDown') { activeIndex = Math.min(activeIndex + 1, shown.length - 1); render(); e.preventDefault(); }
+  else if (e.key === 'ArrowUp') { activeIndex = Math.max(activeIndex - 1, 0); render(); e.preventDefault(); }
+  else if (e.key === 'Enter' && shown[activeIndex]) { apply(shown[activeIndex].name); }
+});
+$('nomatch').onclick = () => apply(NO_MATCH);
+$('clear').onclick = () => apply('');
+
+google.script.run
+  .withSuccessHandler(list => {
+    items = list.map(it => ({ name: it.name, price: it.price, norm: norm(it.name) }));
+    render();
+    poll();
+    setInterval(poll, 1500);
+    $('q').focus();
+  })
+  .withFailureHandler(e => { $('ctx').textContent = e.message; })
+  .getPriceList();
+</script>
+</body>
+</html>
