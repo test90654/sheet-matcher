@@ -25,6 +25,10 @@ NO_MATCH = '(一致させない)'
 MATCHED_COL = '価格表側の商品名'
 CANDIDATE_COL = '要確認_候補'
 
+# 価格比較タブ：突合で商品名の対応が確定した商品について、各店舗の買取価格を並べる
+COMPARE_SHEET_NAME = '価格比較'
+MAIN_LABEL = 'ドラゴンボーン'  # メインの価格表（PRICE_ID）の店舗名
+
 # 追加の買取価格表（店舗ごとに価格列を横に並べる）
 # (列名の接頭辞, スプレッドシートIDの環境変数名)。IDが未設定の店舗は飛ばす。
 # figure-kaitori-bot の形式（「現在一覧」タブ、状態=削除 の行は対象外）を想定。
@@ -282,6 +286,59 @@ def write_result(sh, merged_df, dropdowns=((MANUAL_COL, LIST_SHEET_NAME),)):
         sh.batch_update({'requests': requests})
 
 
+def parse_price(value):
+    """「¥1,200」「1200円」などを数値にする。数値にできなければ None"""
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    s = re.sub(r'[¥￥,，円\s]', '', str(value))
+    try:
+        n = float(s)
+    except ValueError:
+        return None
+    return int(n) if n.is_integer() else n
+
+
+def price_lookup(df_price, name_col, label):
+    """価格表の 商品名→買取価格 の辞書。価格の列が見つからなければ空"""
+    price_col = next((c for c in df_price.columns if '価格' in c), None)
+    if price_col is None:
+        print(f"[{label}] 価格の列が見つからないため、価格比較では価格を空欄にします。")
+        print(f"::warning::{label}: price column not found")
+        return {}
+    # 突合と同じく、同じ商品名が複数あれば最後の行を使う
+    return {n: parse_price(p) for n, p in zip(df_price[name_col].astype(str).str.strip(), df_price[price_col]) if n}
+
+
+def write_compare(sh, merged_df, jan_col, master_name_col, stores):
+    """価格比較タブを書き出す。1店舗以上で商品名の対応が確定した商品だけを載せる
+    stores: (店舗名, 結果の中のその店舗の商品名の列, 商品名→価格 の辞書) の組"""
+    header = ([jan_col] if jan_col else []) + [master_name_col]
+    for label, _, _ in stores:
+        header += [f'{label}_商品名', f'{label}_買取価格']
+    header += ['最高値の店舗', '最高値']
+
+    rows = []
+    for _, r in merged_df.iterrows():
+        names = [str(r[col]).strip() for _, col, _ in stores]
+        if not any(names):
+            continue
+        row = ([str(r[jan_col])] if jan_col else []) + [str(r[master_name_col])]
+        prices = []
+        for (label, _, lookup), name in zip(stores, names):
+            p = lookup.get(name) if name else None
+            row += [name, '' if p is None else p]
+            prices.append((label, p))
+        known = [(label, p) for label, p in prices if p is not None]
+        top = max((p for _, p in known), default=None)
+        row += ['・'.join(label for label, p in known if p == top) if top is not None else '', '' if top is None else top]
+        rows.append(row)
+
+    overwrite_tab(sh, COMPARE_SHEET_NAME, [header] + rows)
+    print(f"価格比較: {len(rows)}件")
+
+
 def load_extra_price_df(gc, sheet_id):
     """追加店舗の価格表を読む。「現在一覧」タブがなければ最初のタブ。掲載終了(削除)の行は除く"""
     sh = gc.open_by_key(sheet_id)
@@ -363,12 +420,15 @@ def execute_sheet_matching(master_sheet_id, price_sheet_id, threshold=MATCH_THRE
     # 結果タブを上書きする前に、取り込んだ手動指定を保存しておく
     save_manual(master_sh, manual, merged_df, jan_col, master_name_col)
     write_name_list(master_sh, df_price, price_name_col)
+    stores = [(MAIN_LABEL, MATCHED_COL, price_lookup(df_price, price_name_col, MAIN_LABEL))]
     for label, df_extra, extra_manual in extra_done:
         _, manual_sheet, list_sheet = extra_names(label)
         extra_name_col = find_columns(df_master, df_extra)[2]
         save_manual(master_sh, extra_manual, merged_df, jan_col, master_name_col, manual_sheet)
         write_name_list(master_sh, df_extra, extra_name_col, list_sheet)
+        stores.append((label, f'{label}_商品名', price_lookup(df_extra, extra_name_col, label)))
     write_result(master_sh, merged_df, dropdowns)
+    write_compare(master_sh, merged_df, jan_col, master_name_col, stores)
     print("すべての処理が完了しました！")
 
 
