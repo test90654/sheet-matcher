@@ -316,6 +316,15 @@ def match_dataframes(df_master, df_price, threshold=MATCH_THRESHOLD, review_thre
             mutual = np.array([back_best.get(p) == t for p, t in zip(best_idx, targets)], dtype=bool)
 
         auto = review & nums_same & mutual & (best_score >= AUTO_REVIEW_MIN) & (best_score - second_score >= AUTO_REVIEW_MARGIN)
+
+        # 短いほうの名前が長いほうに含まれているだけで、長いほうの後ろに語が余っている（「発光ヘッド」など商品の種類）なら、
+        # 別の商品の可能性があるので自動では確定せず要確認にする（頭に作品名が余っているだけなら確定してよい）
+        tails = np.array([extra_tail(mn, cn) if (o or a_) else ''
+                          for mn, cn, o, a_ in zip(master_names[targets], cand_names, ok, auto)], dtype=object)
+        tail_hold = (ok | auto) & (tails != '')
+        ok &= ~tail_hold
+        auto &= ~tail_hold
+        review |= tail_hold
         review &= ~auto
 
         # 価格表の1商品には、マスターの1商品だけを結び付ける
@@ -359,14 +368,35 @@ def match_dataframes(df_master, df_price, threshold=MATCH_THRESHOLD, review_thre
         # 要確認は確定させず、候補として別の列に出す
         merged_df.loc[targets[review], CANDIDATE_COL] = cand_names[review]
         merged_df.loc[targets[review], '一致方法'] = [
+            f'要確認 (片方にだけ語が多い: {t}, 類似度: {s}%)' if t else
             f'要確認 (片方にだけ数字あり, 類似度: {s}%)' if d else f'要確認 (類似度: {s}%)'
-            for s, d in zip(score_text[review], demoted[review])]
+            for s, d, t in zip(score_text[review], demoted[review], tails[review])]
 
         print(f"  あいまい一致: {ok.sum()}件 / 自動判定: {auto.sum()}件 / 作品名の省略: {auto_title.sum()}件 / 要確認: {review.sum()}件"
               f" / 一致なし: {(~ok & ~auto & ~auto_title & ~review).sum()}件（うち数字が違う候補のみ {conflict.sum()}件、くじとプライズの違い {kuji.sum()}件、"
               f"候補が一致済み {taken.sum()}件、候補にもっと近い商品あり {not_closest.sum()}件）")
 
     return merged_df
+
+
+# 後ろに余っていても同じ商品とみなしてよい語
+BENIGN_TAIL_WORDS = ('再販', '再版', '再生産', '新装版')
+
+
+def extra_tail(a, b):
+    """2つの商品名の長さがかなり違うとき、短いほうが長いほうのどこに当たるかを調べ、長いほうの後ろに余った文字を返す
+    （余りがない・頭にだけ余っている・後ろの余りが「再販」などだけ なら空文字）"""
+    ca, cb = clean_text(a), clean_text(b)
+    if not ca or not cb:
+        return ''
+    short, long_ = (ca, cb) if len(ca) <= len(cb) else (cb, ca)
+    if len(short) / len(long_) >= 0.85:
+        return ''
+    al = fuzz.partial_ratio_alignment(short, long_)
+    tail = long_[al.dest_end:]
+    for w in BENIGN_TAIL_WORDS:
+        tail = tail.replace(w, '')
+    return tail if len(tail) >= 2 else ''
 
 
 def combined_scores(queries, queries_sorted, choices, choices_sorted):
