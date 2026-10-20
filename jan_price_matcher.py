@@ -21,6 +21,9 @@ MANUAL_SHEET_NAME = '手動対応表'
 LIST_SHEET_NAME = '価格表_商品名リスト'
 MANUAL_COL = '手動指定'
 NO_MATCH = '(一致させない)'
+# 結果の列名：一致が確定した価格表側の商品名と、要確認の候補
+MATCHED_COL = '価格表側の商品名'
+CANDIDATE_COL = '要確認_候補'
 
 # 追加の買取価格表（店舗ごとに価格列を横に並べる）
 # (列名の接頭辞, スプレッドシートIDの環境変数名)。IDが未設定の店舗は飛ばす。
@@ -71,12 +74,11 @@ def clean_text(text):
 
 
 def find_columns(df_master, df_price):
-    """JAN列・商品名列・価格列を列名から推定する"""
+    """JAN列・マスターの商品名列・価格表の商品名列を列名から推定する"""
     jan_col = next((c for c in df_master.columns if 'JAN' in c or 'バーコード' in c), None)
     master_name_col = next((c for c in df_master.columns if '商品名' in c), df_master.columns[1] if len(df_master.columns) > 1 else df_master.columns[0])
     price_name_col = next((c for c in df_price.columns if '商品名' in c), df_price.columns[1] if len(df_price.columns) > 1 else df_price.columns[0])
-    price_col = next((c for c in df_price.columns if '価格' in c or '買取' in c), df_price.columns[-1])
-    return jan_col, master_name_col, price_name_col, price_col
+    return jan_col, master_name_col, price_name_col
 
 
 def make_key(jan, name):
@@ -86,69 +88,62 @@ def make_key(jan, name):
 
 
 def match_dataframes(df_master, df_price, threshold=MATCH_THRESHOLD, review_threshold=REVIEW_THRESHOLD, manual=None):
-    """マスターと価格表を突合し、結果のDataFrameを返す（manual: キー→価格表側の商品名 の手動指定）"""
-    jan_col, master_name_col, price_name_col, price_col = find_columns(df_master, df_price)
+    """マスターの各商品が、価格表ではどの商品名で載っているかを突合し、結果のDataFrameを返す
+    （manual: キー→価格表側の商品名 の手動指定）"""
+    jan_col, master_name_col, price_name_col = find_columns(df_master, df_price)
 
     merged_df = df_master.copy()
-    if price_col not in merged_df.columns:
-        merged_df[price_col] = ''
+    merged_df[MATCHED_COL] = ''
     merged_df['一致方法'] = ''
     merged_df['類似度'] = ''
-    merged_df['価格表側の商品名'] = ''
-    merged_df['要確認_候補価格'] = ''
+    merged_df[CANDIDATE_COL] = ''
     keys = pd.Series([make_key(j, n) for j, n in zip(merged_df[jan_col] if jan_col else [None] * len(merged_df), merged_df[master_name_col])], index=merged_df.index)
     merged_df[MANUAL_COL] = keys.map(manual or {}).fillna('')
-    # pandas 3 では '' で作った列が文字列専用型になり数値の価格を代入できないため、object型にそろえる
-    merged_df = merged_df.astype(object)
 
     master_names = merged_df[master_name_col].astype(str).str.strip()
     master_cleaned = master_names.map(clean_text)
     price_names = df_price[price_name_col].astype(str).str.strip()
     price_cleaned = price_names.map(clean_text)
-    price_values = df_price[price_col]
-    price_dict = dict(zip(price_names, price_values))
+    price_name_set = set(price_names[price_names != ''])
 
-    # 0. 手動指定（自動突合より優先し、以降の自動突合の対象から外す）
+    # 突合が済んだ行（手動指定した行を含む）。以降の段階の対象から外す
+    done = pd.Series(False, index=merged_df.index)
+
+    # 0. 手動指定（自動突合より優先する）
     manual_vals = merged_df[MANUAL_COL].astype(str).str.strip()
     locked = manual_vals != ''
     if locked.any():
         print(f"手動指定 {locked.sum()} 件を反映しています...")
         no = manual_vals == NO_MATCH
         merged_df.loc[no, '一致方法'] = '手動: 一致させない'
-        found = locked & ~no & manual_vals.isin(price_dict.keys())
-        merged_df.loc[found, price_col] = manual_vals[found].map(price_dict)
+        found = locked & ~no & manual_vals.isin(price_name_set)
         merged_df.loc[found, '一致方法'] = '手動指定'
-        merged_df.loc[found, '価格表側の商品名'] = manual_vals[found]
+        merged_df.loc[found, MATCHED_COL] = manual_vals[found]
         missing = locked & ~no & ~found
         merged_df.loc[missing, '一致方法'] = '手動指定 (価格表に見つかりません)'
         if missing.any():
             print(f"  価格表に見つからない手動指定: {missing.sum()}件")
-
-    def is_unmatched():
-        return (merged_df[price_col].isna() | (merged_df[price_col] == '')) & ~locked
+        done |= locked
 
     # 1. 完全一致
     print("商品名による完全一致処理を実行中...")
-    hit = is_unmatched() & (master_names != '') & master_names.isin(price_dict.keys())
-    merged_df.loc[hit, price_col] = master_names[hit].map(price_dict)
+    hit = ~done & (master_names != '') & master_names.isin(price_name_set)
     merged_df.loc[hit, '一致方法'] = '商品名による完全一致'
-    merged_df.loc[hit, '価格表側の商品名'] = master_names[hit]
+    merged_df.loc[hit, MATCHED_COL] = master_names[hit]
+    done |= hit
 
     # 2. 正規化一致
-    unmatched = is_unmatched()
-    if unmatched.any():
+    if (~done).any():
         print("表記ゆれ（スペース・全角半角）を吸収した完全一致処理を実行中...")
         valid = price_cleaned != ''
-        cleaned_price_dict = dict(zip(price_cleaned[valid], zip(price_names[valid], price_values[valid])))
-        hit = unmatched & (master_cleaned != '') & master_cleaned.isin(cleaned_price_dict.keys())
-        found = master_cleaned[hit].map(cleaned_price_dict)
-        merged_df.loc[hit, price_col] = found.map(lambda x: x[1])
+        cleaned_price_dict = dict(zip(price_cleaned[valid], price_names[valid]))
+        hit = ~done & (master_cleaned != '') & master_cleaned.isin(cleaned_price_dict.keys())
         merged_df.loc[hit, '一致方法'] = '正規化による完全一致'
-        merged_df.loc[hit, '価格表側の商品名'] = found.map(lambda x: x[0])
+        merged_df.loc[hit, MATCHED_COL] = master_cleaned[hit].map(cleaned_price_dict)
+        done |= hit
 
     # 3. 厳格あいまい一致（全CPUでまとめて計算）
-    unmatched = is_unmatched()
-    targets = merged_df.index[unmatched & (master_cleaned != '')]
+    targets = merged_df.index[~done & (master_cleaned != '')]
     if len(targets) > 0 and len(df_price) > 0:
         print(f"残りの {len(targets)} 件について、しきい値 {threshold:g}% 以上（{review_threshold:g}% 以上は要確認）の厳格なあいまい検索を実行します...")
         choices = price_cleaned.tolist()
@@ -163,7 +158,6 @@ def match_dataframes(df_master, df_price, threshold=MATCH_THRESHOLD, review_thre
 
         best_score = best_score.round(1)
         cand_names = price_names.to_numpy()[best_idx]
-        cand_prices = price_values.to_numpy()[best_idx]
         score_text = [f'{s:g}' for s in best_score]
 
         merged_df.loc[targets, '類似度'] = score_text
@@ -172,12 +166,11 @@ def match_dataframes(df_master, df_price, threshold=MATCH_THRESHOLD, review_thre
         ok = best_score >= threshold
         review = ~ok & (best_score >= review_threshold)
 
-        merged_df.loc[targets[ok], price_col] = cand_prices[ok]
-        merged_df.loc[targets[ok], '価格表側の商品名'] = cand_names[ok]
+        merged_df.loc[targets[ok], MATCHED_COL] = cand_names[ok]
         merged_df.loc[targets[ok], '一致方法'] = [f'厳格あいまい一致 (類似度: {s}%)' for s in np.array(score_text)[ok]]
 
-        merged_df.loc[targets[review], '価格表側の商品名'] = cand_names[review]
-        merged_df.loc[targets[review], '要確認_候補価格'] = cand_prices[review]
+        # 要確認は確定させず、候補として別の列に出す
+        merged_df.loc[targets[review], CANDIDATE_COL] = cand_names[review]
         merged_df.loc[targets[review], '一致方法'] = [f'要確認 (類似度: {s}%)' for s in np.array(score_text)[review]]
 
         print(f"  あいまい一致: {ok.sum()}件 / 要確認: {review.sum()}件 / 一致なし: {(~ok & ~review).sum()}件")
@@ -254,13 +247,12 @@ def save_manual(sh, manual, merged_df, jan_col, master_name_col, manual_sheet=MA
     overwrite_tab(sh, manual_sheet, data)
 
 
-def write_price_list(sh, df_price, price_name_col, price_col, list_sheet=LIST_SHEET_NAME):
-    """プルダウンと検索サイドバーの選択肢として、価格表の商品名と価格をマスター側のタブにコピーする
+def write_name_list(sh, df_price, price_name_col, list_sheet=LIST_SHEET_NAME):
+    """プルダウンと検索サイドバーの選択肢として、価格表の商品名をマスター側のタブにコピーする
     （入力規則では別のスプレッドシートの範囲を参照できないため）"""
-    # 突合と同じく、同じ商品名が複数あれば最後の行の価格を使う
-    prices = dict(zip(df_price[price_name_col].astype(str).str.strip(), df_price[price_col]))
-    rows = [[n, '' if pd.isna(p) else str(p)] for n, p in prices.items() if n]
-    overwrite_tab(sh, list_sheet, [['価格表の商品名', '買取価格'], [NO_MATCH, '']] + rows)
+    names = dict.fromkeys(n for n in df_price[price_name_col].astype(str).str.strip() if n)
+    # 以前の版で書いていた価格列が残らないよう、2列目は空で上書きする
+    overwrite_tab(sh, list_sheet, [['価格表の商品名', ''], [NO_MATCH, '']] + [[n, ''] for n in names])
 
 
 def write_result(sh, merged_df, dropdowns=((MANUAL_COL, LIST_SHEET_NAME),)):
@@ -306,23 +298,21 @@ def load_extra_price_df(gc, sheet_id):
     return df.reset_index(drop=True)
 
 
-def add_extra_prices(merged_df, df_master, df_extra, label, threshold, review_threshold, manual=None):
-    """追加店舗の価格表と突合し、「<店舗>_買取価格」などの列を結果の右側に追加する
+def add_extra_matches(merged_df, df_master, df_extra, label, threshold, review_threshold, manual=None):
+    """追加店舗の価格表と突合し、「<店舗>_商品名」などの列を結果の右側に追加する
     manual: その店舗用の手動指定（キー→その店舗の価格表の商品名）"""
-    jan_col, master_name_col, _, _ = find_columns(df_master, df_extra)
+    jan_col, master_name_col, _ = find_columns(df_master, df_extra)
     keep = [c for c in (jan_col, master_name_col) if c]
-    # マスターの他の列と価格列の名前がぶつからないよう、JANと商品名だけで突合する
+    # マスターの他の列と名前がぶつからないよう、JANと商品名だけで突合する
     sub = match_dataframes(df_master[keep].copy(), df_extra, threshold, review_threshold, manual)
-    price_col = find_columns(df_master, df_extra)[3]
 
-    merged_df[f'{label}_買取価格'] = sub[price_col].values
-    merged_df[f'{label}_要確認_候補価格'] = sub['要確認_候補価格'].values
-    merged_df[f'{label}_商品名'] = sub['価格表側の商品名'].values
+    merged_df[f'{label}_商品名'] = sub[MATCHED_COL].values
     merged_df[f'{label}_一致方法'] = sub['一致方法'].values
+    merged_df[f'{label}_{CANDIDATE_COL}'] = sub[CANDIDATE_COL].values
     merged_df[extra_names(label)[0]] = sub[MANUAL_COL].values
 
-    hit = (sub[price_col].astype(str).str.strip() != '').sum()
-    review = (sub['要確認_候補価格'].astype(str).str.strip() != '').sum()
+    hit = (sub[MATCHED_COL].astype(str).str.strip() != '').sum()
+    review = (sub[CANDIDATE_COL].astype(str).str.strip() != '').sum()
     print(f"[{label}] 一致: {hit}件 / 要確認: {review}件 / 価格表 {len(df_extra)}件")
     print(f"::notice::extra source {len(df_extra)} rows, matched={hit}, review={review}")
     return merged_df
@@ -344,7 +334,7 @@ def execute_sheet_matching(master_sheet_id, price_sheet_id, threshold=MATCH_THRE
     print(f"マスターデータ件数: {len(df_master)}件")
     print(f"買取価格表件数: {len(df_price)}件")
 
-    jan_col, master_name_col, price_name_col, price_col = find_columns(df_master, df_price)
+    jan_col, master_name_col, price_name_col = find_columns(df_master, df_price)
     manual = load_manual(master_sh, jan_col, master_name_col)
 
     merged_df = match_dataframes(df_master, df_price, threshold, review_threshold, manual)
@@ -366,18 +356,18 @@ def execute_sheet_matching(master_sheet_id, price_sheet_id, threshold=MATCH_THRE
         manual_col, manual_sheet, list_sheet = extra_names(label)
         # 結果タブを上書きする前に、その店舗の手動指定を読んでおく
         extra_manual = load_manual(master_sh, jan_col, master_name_col, manual_sheet, manual_col)
-        merged_df = add_extra_prices(merged_df, df_master, df_extra, label, threshold, review_threshold, extra_manual)
+        merged_df = add_extra_matches(merged_df, df_master, df_extra, label, threshold, review_threshold, extra_manual)
         extra_done.append((label, df_extra, extra_manual))
         dropdowns.append((manual_col, list_sheet))
 
     # 結果タブを上書きする前に、取り込んだ手動指定を保存しておく
     save_manual(master_sh, manual, merged_df, jan_col, master_name_col)
-    write_price_list(master_sh, df_price, price_name_col, price_col)
+    write_name_list(master_sh, df_price, price_name_col)
     for label, df_extra, extra_manual in extra_done:
         _, manual_sheet, list_sheet = extra_names(label)
-        _, _, extra_name_col, extra_price_col = find_columns(df_master, df_extra)
+        extra_name_col = find_columns(df_master, df_extra)[2]
         save_manual(master_sh, extra_manual, merged_df, jan_col, master_name_col, manual_sheet)
-        write_price_list(master_sh, df_extra, extra_name_col, extra_price_col, list_sheet)
+        write_name_list(master_sh, df_extra, extra_name_col, list_sheet)
     write_result(master_sh, merged_df, dropdowns)
     print("すべての処理が完了しました！")
 

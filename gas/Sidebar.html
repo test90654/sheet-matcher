@@ -19,7 +19,6 @@
   li { display: flex; justify-content: space-between; gap: 8px; padding: 7px 8px; border-bottom: 1px solid #eee; cursor: pointer; }
   li:hover, li.active { background: #e8f0fe; }
   li .n { word-break: break-all; }
-  li .p { white-space: nowrap; color: #188038; }
   li.cand .n::before { content: '候補 '; color: #b06000; font-size: 11px; }
   .status { min-height: 18px; margin-top: 8px; font-size: 12px; color: #188038; }
   .status.error { color: #d93025; }
@@ -42,7 +41,7 @@
 <script>
 const NO_MATCH = '(一致させない)';
 const MAX_RESULTS = 100;
-let items = [];      // {name, price, norm}
+let items = [];      // {name, norm}
 let ctx = null;      // 選択中の行
 let shown = [];      // 表示中の候補
 let activeIndex = 0;
@@ -88,9 +87,7 @@ function render() {
     if (ctx && ctx.ok && it.name === ctx.candidate) li.classList.add('cand');
     if (i === activeIndex) li.classList.add('active');
     const n = document.createElement('span'); n.className = 'n'; n.textContent = it.name;
-    const p = document.createElement('span'); p.className = 'p'; p.textContent = it.price ? `¥${Number(it.price).toLocaleString()}` : '';
-    if (it.price && isNaN(Number(it.price))) p.textContent = it.price;
-    li.append(n, p);
+    li.append(n);
     li.onclick = () => apply(it.name);
     list.appendChild(li);
   });
@@ -157,14 +154,14 @@ $('clear').onclick = () => apply('');
 
 google.script.run
   .withSuccessHandler(list => {
-    items = list.map(it => ({ name: it.name, price: it.price, norm: norm(it.name) }));
+    items = list.map(name => ({ name: name, norm: norm(name) }));
     render();
     poll();
     setInterval(poll, 1500);
     $('q').focus();
   })
   .withFailureHandler(e => { $('ctx').textContent = e.message; })
-  .getPriceList();
+  .getNameList();
 </script>
 </body>
 </html>
