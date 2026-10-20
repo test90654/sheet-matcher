@@ -29,8 +29,17 @@ EXTRA_PRICE_SOURCES = [
     ('千葉鑑定団', 'CHIBAKAN_PRICE_ID'),
 ]
 EXTRA_PRICE_TAB = '現在一覧'
+
+
+def extra_names(label):
+    """追加店舗ごとの 手動指定の列名・手動対応表のタブ名・プルダウン選択肢のタブ名"""
+    return f'{label}_{MANUAL_COL}', f'{MANUAL_SHEET_NAME}_{label}', f'{LIST_SHEET_NAME}_{label}'
+
 EXTRA_STATUS_COL = '状態'
 EXTRA_REMOVED = '削除'
+
+# タブの右側に残しておく空き列の数
+SPARE_COLS = 5
 
 # あいまい一致を一度に計算する行数（メモリ使用量の上限を抑えるため）
 FUZZY_CHUNK_SIZE = 1000
@@ -183,11 +192,12 @@ def overwrite_tab(sh, title, data_to_write):
         ws = sh.worksheet(title)
         print(f"既存のタブ「{title}」の内容を上書きしています...")
         ws.clear()
-        if ws.row_count < rows or ws.col_count < cols:
-            ws.resize(rows=max(ws.row_count, rows), cols=max(ws.col_count, cols))
+        # 右側に余白の列を残しておく（列を広げたり、メモ用の列を足したりできるように）
+        if ws.row_count < rows or ws.col_count < cols + SPARE_COLS:
+            ws.resize(rows=max(ws.row_count, rows), cols=max(ws.col_count, cols + SPARE_COLS))
     except gspread.exceptions.WorksheetNotFound:
         print(f"新しいタブ「{title}」を作成して書き込んでいます...")
-        ws = sh.add_worksheet(title=title, rows=rows + 10, cols=cols + 5)
+        ws = sh.add_worksheet(title=title, rows=rows + 10, cols=cols + SPARE_COLS)
 
     ws.update(range_name='A1', values=data_to_write)
     return ws
@@ -201,19 +211,19 @@ def read_tab(sh, title):
         return []
 
 
-def load_manual(sh, jan_col, master_name_col):
+def load_manual(sh, jan_col, master_name_col, manual_sheet=MANUAL_SHEET_NAME, manual_col=MANUAL_COL):
     """手動対応表を読み、前回の結果タブの「手動指定」列での変更を反映した 手動指定の辞書を返す"""
     manual = {}
-    for row in read_tab(sh, MANUAL_SHEET_NAME)[1:]:
+    for row in read_tab(sh, manual_sheet)[1:]:
         if len(row) >= 3 and row[0].strip() and row[2].strip():
             manual[row[0].strip()] = row[2].strip()
 
     # 結果タブの「手動指定」列は手動対応表の内容で毎回埋めて出力しているので、
     # 入力されていれば登録・変更、空になっていれば削除として扱う
     values = read_tab(sh, OUTPUT_SHEET_NAME)
-    if values and MANUAL_COL in values[0]:
+    if values and manual_col in values[0]:
         header = values[0]
-        mi = header.index(MANUAL_COL)
+        mi = header.index(manual_col)
         ji = header.index(jan_col) if jan_col in header else None
         ni = header.index(master_name_col) if master_name_col in header else None
         if ni is not None:
@@ -230,46 +240,54 @@ def load_manual(sh, jan_col, master_name_col):
                     manual.pop(key, None)
             added = sum(1 for k in manual if before.get(k) != manual[k])
             removed = sum(1 for k in before if k not in manual)
-            print(f"結果タブの手動指定を取り込みました（登録・変更: {added}件 / 削除: {removed}件）")
+            print(f"結果タブの「{manual_col}」を取り込みました（登録・変更: {added}件 / 削除: {removed}件）")
     return manual
 
 
-def save_manual(sh, manual, merged_df, jan_col, master_name_col):
+def save_manual(sh, manual, merged_df, jan_col, master_name_col, manual_sheet=MANUAL_SHEET_NAME):
     """手動指定を手動対応表タブに保存する（次回以降の実行でも引き継ぐため）"""
     names = {}
     for j, n in zip(merged_df[jan_col] if jan_col else [None] * len(merged_df), merged_df[master_name_col]):
         names.setdefault(make_key(j, n), str(n))
     data = [['キー(JANまたは商品名)', 'マスター商品名', '価格表側の商品名']]
     data += [[k, names.get(k, ''), v] for k, v in sorted(manual.items())]
-    overwrite_tab(sh, MANUAL_SHEET_NAME, data)
+    overwrite_tab(sh, manual_sheet, data)
 
 
-def write_price_list(sh, df_price, price_name_col, price_col):
+def write_price_list(sh, df_price, price_name_col, price_col, list_sheet=LIST_SHEET_NAME):
     """プルダウンと検索サイドバーの選択肢として、価格表の商品名と価格をマスター側のタブにコピーする
     （入力規則では別のスプレッドシートの範囲を参照できないため）"""
     # 突合と同じく、同じ商品名が複数あれば最後の行の価格を使う
     prices = dict(zip(df_price[price_name_col].astype(str).str.strip(), df_price[price_col]))
     rows = [[n, '' if pd.isna(p) else str(p)] for n, p in prices.items() if n]
-    overwrite_tab(sh, LIST_SHEET_NAME, [['価格表の商品名', '買取価格'], [NO_MATCH, '']] + rows)
+    overwrite_tab(sh, list_sheet, [['価格表の商品名', '買取価格'], [NO_MATCH, '']] + rows)
 
 
-def write_result(sh, merged_df):
-    """結果タブを上書きし、「手動指定」列に価格表の商品名のプルダウンを付ける"""
+def write_result(sh, merged_df, dropdowns=((MANUAL_COL, LIST_SHEET_NAME),)):
+    """結果タブを上書きし、各「手動指定」列に対応する価格表の商品名のプルダウンを付ける
+    dropdowns: (手動指定の列名, 選択肢のタブ名) の組"""
     merged_df = merged_df.fillna('').astype(str)
     data_to_write = [merged_df.columns.tolist()] + merged_df.values.tolist()
     ws = overwrite_tab(sh, OUTPUT_SHEET_NAME, data_to_write)
+    print(f"::notice::result tab written: rows={len(data_to_write)} cols={len(data_to_write[0])} sheet_cols={ws.col_count}")
 
-    ci = merged_df.columns.get_loc(MANUAL_COL)
-    sh.batch_update({'requests': [{'setDataValidation': {
-        'range': {'sheetId': ws.id, 'startRowIndex': 1, 'endRowIndex': len(data_to_write),
-                  'startColumnIndex': ci, 'endColumnIndex': ci + 1},
-        'rule': {
-            'condition': {'type': 'ONE_OF_RANGE', 'values': [{'userEnteredValue': f"='{LIST_SHEET_NAME}'!$A$2:$A"}]},
-            'showCustomUi': True,
-            # 価格表から消えた商品名が残っていても警告表示にとどめる
-            'strict': False,
-        },
-    }}]})
+    requests = []
+    for col, list_sheet in dropdowns:
+        if col not in merged_df.columns:
+            continue
+        ci = merged_df.columns.get_loc(col)
+        requests.append({'setDataValidation': {
+            'range': {'sheetId': ws.id, 'startRowIndex': 1, 'endRowIndex': len(data_to_write),
+                      'startColumnIndex': ci, 'endColumnIndex': ci + 1},
+            'rule': {
+                'condition': {'type': 'ONE_OF_RANGE', 'values': [{'userEnteredValue': f"='{list_sheet}'!$A$2:$A"}]},
+                'showCustomUi': True,
+                # 価格表から消えた商品名が残っていても警告表示にとどめる
+                'strict': False,
+            },
+        }})
+    if requests:
+        sh.batch_update({'requests': requests})
 
 
 def load_extra_price_df(gc, sheet_id):
@@ -288,23 +306,25 @@ def load_extra_price_df(gc, sheet_id):
     return df.reset_index(drop=True)
 
 
-def add_extra_prices(merged_df, df_master, df_extra, label, threshold, review_threshold):
+def add_extra_prices(merged_df, df_master, df_extra, label, threshold, review_threshold, manual=None):
     """追加店舗の価格表と突合し、「<店舗>_買取価格」などの列を結果の右側に追加する
-    （手動指定はメインの価格表用なので、ここでは使わない）"""
+    manual: その店舗用の手動指定（キー→その店舗の価格表の商品名）"""
     jan_col, master_name_col, _, _ = find_columns(df_master, df_extra)
     keep = [c for c in (jan_col, master_name_col) if c]
     # マスターの他の列と価格列の名前がぶつからないよう、JANと商品名だけで突合する
-    sub = match_dataframes(df_master[keep].copy(), df_extra, threshold, review_threshold)
+    sub = match_dataframes(df_master[keep].copy(), df_extra, threshold, review_threshold, manual)
     price_col = find_columns(df_master, df_extra)[3]
 
     merged_df[f'{label}_買取価格'] = sub[price_col].values
     merged_df[f'{label}_要確認_候補価格'] = sub['要確認_候補価格'].values
     merged_df[f'{label}_商品名'] = sub['価格表側の商品名'].values
     merged_df[f'{label}_一致方法'] = sub['一致方法'].values
+    merged_df[extra_names(label)[0]] = sub[MANUAL_COL].values
 
     hit = (sub[price_col].astype(str).str.strip() != '').sum()
     review = (sub['要確認_候補価格'].astype(str).str.strip() != '').sum()
     print(f"[{label}] 一致: {hit}件 / 要確認: {review}件 / 価格表 {len(df_extra)}件")
+    print(f"::notice::extra source {len(df_extra)} rows, matched={hit}, review={review}")
     return merged_df
 
 
@@ -329,22 +349,36 @@ def execute_sheet_matching(master_sheet_id, price_sheet_id, threshold=MATCH_THRE
 
     merged_df = match_dataframes(df_master, df_price, threshold, review_threshold, manual)
 
+    dropdowns = [(MANUAL_COL, LIST_SHEET_NAME)]
+    extra_done = []
     for label, env_name in EXTRA_PRICE_SOURCES:
         sheet_id = os.environ.get(env_name, '').strip()
         if not sheet_id:
             print(f"[{label}] {env_name} が未設定のため飛ばします。")
+            print(f"::warning::{env_name} is not set; skipped")
             continue
         print(f"[{label}] 買取価格表を取得しています...")
         df_extra = load_extra_price_df(gc, sheet_id)
         if df_extra.empty:
             print(f"[{label}] 価格表が空のため飛ばします。")
+            print(f"::warning::{env_name}: price sheet is empty; skipped")
             continue
-        merged_df = add_extra_prices(merged_df, df_master, df_extra, label, threshold, review_threshold)
+        manual_col, manual_sheet, list_sheet = extra_names(label)
+        # 結果タブを上書きする前に、その店舗の手動指定を読んでおく
+        extra_manual = load_manual(master_sh, jan_col, master_name_col, manual_sheet, manual_col)
+        merged_df = add_extra_prices(merged_df, df_master, df_extra, label, threshold, review_threshold, extra_manual)
+        extra_done.append((label, df_extra, extra_manual))
+        dropdowns.append((manual_col, list_sheet))
 
     # 結果タブを上書きする前に、取り込んだ手動指定を保存しておく
     save_manual(master_sh, manual, merged_df, jan_col, master_name_col)
     write_price_list(master_sh, df_price, price_name_col, price_col)
-    write_result(master_sh, merged_df)
+    for label, df_extra, extra_manual in extra_done:
+        _, manual_sheet, list_sheet = extra_names(label)
+        _, _, extra_name_col, extra_price_col = find_columns(df_master, df_extra)
+        save_manual(master_sh, extra_manual, merged_df, jan_col, master_name_col, manual_sheet)
+        write_price_list(master_sh, df_extra, extra_name_col, extra_price_col, list_sheet)
+    write_result(master_sh, merged_df, dropdowns)
     print("すべての処理が完了しました！")
 
 
