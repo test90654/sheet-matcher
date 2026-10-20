@@ -20,15 +20,15 @@ function showSearchSidebar() {
   SpreadsheetApp.getUi().showSidebar(html);
 }
 
-// 価格表の商品名と価格の一覧（サイドバーの検索対象）
-function getPriceList() {
+// 価格表の商品名の一覧（サイドバーの検索対象）
+function getNameList() {
   const sheet = SpreadsheetApp.getActive().getSheetByName(LIST_SHEET);
   if (!sheet) throw new Error(`「${LIST_SHEET}」タブがありません。先に GitHub Actions で突合を実行してください。`);
   const last = sheet.getLastRow();
   if (last < 2) return [];
-  return sheet.getRange(2, 1, last - 1, 2).getDisplayValues()
-    .filter(r => r[0] && r[0] !== NO_MATCH)
-    .map(r => ({ name: r[0], price: r[1] }));
+  return sheet.getRange(2, 1, last - 1, 1).getDisplayValues()
+    .map(r => r[0])
+    .filter(n => n && n !== NO_MATCH);
 }
 
 function resultColumns_(sheet) {
@@ -38,7 +38,8 @@ function resultColumns_(sheet) {
     // マスターの列が先に並ぶので、最初に「商品名」を含む列がマスター側の商品名
     name: header.findIndex(c => c.includes('商品名')),
     method: header.indexOf('一致方法'),
-    candidate: header.indexOf('価格表側の商品名'),
+    matched: header.indexOf('価格表側の商品名'),
+    candidate: header.indexOf('要確認_候補'),
     manual: header.indexOf(MANUAL_COL),
   };
 }
@@ -62,7 +63,8 @@ function getContext() {
     row: row,
     name: cols.name >= 0 ? v[cols.name] : '',
     method: cols.method >= 0 ? v[cols.method] : '',
-    candidate: cols.candidate >= 0 ? v[cols.candidate] : '',
+    // 要確認の候補、なければ一致済みの商品名を検索結果の先頭に出す
+    candidate: (cols.candidate >= 0 ? v[cols.candidate] : '') || (cols.matched >= 0 ? v[cols.matched] : ''),
     manual: v[cols.manual],
   };
 }
