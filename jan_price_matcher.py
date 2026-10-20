@@ -34,6 +34,9 @@ MAIN_LABEL = 'ドラゴンボーン'  # メインの価格表（PRICE_ID）の�
 # figure-kaitori-bot の形式（「現在一覧」タブ、状態=削除 の行は対象外）を想定。
 EXTRA_PRICE_SOURCES = [
     ('千葉鑑定団', 'CHIBAKAN_PRICE_ID'),
+    ('らしんばん', 'LASHINBANG_PRICE_ID'),
+    # twitter-rss-discord-bot の承認ダッシュボードが書く形式（sheet1、ジャンル/商品名/価格/更新日/型番・JAN）
+    ('ムーラン', 'MOULIN_PRICE_ID'),
 ]
 EXTRA_PRICE_TAB = '現在一覧'
 
@@ -44,6 +47,7 @@ def extra_names(label):
 
 EXTRA_STATUS_COL = '状態'
 EXTRA_REMOVED = '削除'
+UPDATED_COL = '更新日'
 
 # タブの右側に残しておく空き列の数
 SPARE_COLS = 5
@@ -339,9 +343,15 @@ def write_compare(sh, merged_df, jan_col, master_name_col, stores):
     print(f"価格比較: {len(rows)}件")
 
 
-def load_extra_price_df(gc, sheet_id):
-    """追加店舗の価格表を読む。「現在一覧」タブがなければ最初のタブ。掲載終了(削除)の行は除く"""
-    sh = gc.open_by_key(sheet_id)
+def sheet_key(value):
+    """スプレッドシートのIDを取り出す（URLを丸ごと渡されてもよい）"""
+    m = re.search(r'/spreadsheets/d/([A-Za-z0-9_-]+)', value)
+    return m.group(1) if m else value.strip()
+
+
+def load_price_df(gc, sheet_id):
+    """価格表を読む。「現在一覧」タブがなければ最初のタブ。掲載終了(削除)の行は除く"""
+    sh = gc.open_by_key(sheet_key(sheet_id))
     try:
         ws = sh.worksheet(EXTRA_PRICE_TAB)
     except gspread.exceptions.WorksheetNotFound:
@@ -352,6 +362,11 @@ def load_extra_price_df(gc, sheet_id):
     df.columns = df.columns.str.strip()
     if EXTRA_STATUS_COL in df.columns:
         df = df[df[EXTRA_STATUS_COL].astype(str).str.strip() != EXTRA_REMOVED]
+    if UPDATED_COL in df.columns:
+        # 同じ商品名が何度も載る記録形式の表では、同名なら最後の行を使うので、更新日の古い順に並べておく
+        # 日付として読めない行は先頭（＝古い扱い）にする
+        dates = pd.to_datetime(df[UPDATED_COL].astype(str).str.strip(), errors='coerce', format='mixed')
+        df = df.loc[dates.sort_values(kind='stable', na_position='first').index]
     return df.reset_index(drop=True)
 
 
@@ -379,14 +394,14 @@ def execute_sheet_matching(master_sheet_id, price_sheet_id, threshold=MATCH_THRE
     gc = get_client()
     print("Googleスプレッドシートからデータを取得しています...")
 
-    master_sh = gc.open_by_key(master_sheet_id)
-    price_sh = gc.open_by_key(price_sheet_id)
-
+    master_sh = gc.open_by_key(sheet_key(master_sheet_id))
     df_master = pd.DataFrame(master_sh.get_worksheet(0).get_all_records())
-    df_price = pd.DataFrame(price_sh.get_worksheet(0).get_all_records())
-
     df_master.columns = df_master.columns.str.strip()
-    df_price.columns = df_price.columns.str.strip()
+
+    # メインの価格表も追加店舗と同じく「現在一覧」タブ（なければ最初のタブ）から、削除済みを除いて読む
+    df_price = load_price_df(gc, price_sheet_id)
+    if df_price.empty:
+        raise ValueError("メインの価格表が空です。PRICE_ID のスプレッドシートを確認してください。")
 
     print(f"マスターデータ件数: {len(df_master)}件")
     print(f"買取価格表件数: {len(df_price)}件")
@@ -405,7 +420,7 @@ def execute_sheet_matching(master_sheet_id, price_sheet_id, threshold=MATCH_THRE
             print(f"::warning::{env_name} is not set; skipped")
             continue
         print(f"[{label}] 買取価格表を取得しています...")
-        df_extra = load_extra_price_df(gc, sheet_id)
+        df_extra = load_price_df(gc, sheet_id)
         if df_extra.empty:
             print(f"[{label}] 価格表が空のため飛ばします。")
             print(f"::warning::{env_name}: price sheet is empty; skipped")

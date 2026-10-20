@@ -35,6 +35,10 @@ jobs:
           PRICE_SHEET_ID: ${{ secrets.PRICE_ID }}
           # 追加の買取価格表（figure-kaitori-bot の千葉鑑定団船橋のシート）。未設定なら飛ばす
           CHIBAKAN_PRICE_ID: ${{ secrets.CHIBAKAN_PRICE_ID }}
+          # figure-kaitori-bot のらしんばんのシート。未設定なら飛ばす
+          LASHINBANG_PRICE_ID: ${{ secrets.LASHINBANG_PRICE_ID }}
+          # twitter-rss-discord-bot のムーラン買取データのシート。未設定なら飛ばす
+          MOULIN_PRICE_ID: ${{ secrets.MOULIN_PRICE_ID }}
           MATCH_THRESHOLD: ${{ inputs.match_threshold || '95' }}
           REVIEW_THRESHOLD: ${{ inputs.review_threshold || '85' }}
         run: |
