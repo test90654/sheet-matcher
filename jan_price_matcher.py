@@ -50,6 +50,7 @@ def extra_names(label):
 EXTRA_STATUS_COL = '状態'
 EXTRA_REMOVED = '削除'
 UPDATED_COL = '更新日'
+WORK_COL = '作品名'
 
 # タブの右側に残しておく空き列の数
 SPARE_COLS = 5
@@ -104,6 +105,16 @@ def clean_text(text):
 def sorted_tokens(text):
     """語順の違いを吸収するため、単語を並べ替えてつないだ文字列"""
     return ' '.join(sorted(t.replace('ー', '') for t in to_tokens(text)))
+
+
+# 一番くじなど「くじ」の景品。通常のプライズとは別商品なので、片方だけがくじなら一致させない
+KUJI_PATTERN = re.compile(r'(?:くじ|クジ)(?![らラ])|一番賞|ラストワン|ダブルチャンス|(?<![a-z0-9])[a-z]賞')
+
+
+def is_kuji(text):
+    if pd.isna(text) or not isinstance(text, str):
+        return False
+    return bool(KUJI_PATTERN.search(unicodedata.normalize('NFKC', text).lower()))
 
 
 def numbers_in(text):
@@ -227,14 +238,19 @@ def match_dataframes(df_master, df_price, threshold=MATCH_THRESHOLD, review_thre
         # 両方に数字があって食い違う（第1弾と第2弾など）なら、別商品と判断して要確認にも出さない
         # 片方にしか数字がない場合は判断できないので要確認に残す
         nums_conflict = np.array([bool(a) and bool(b) and a != b for a, b in zip(master_nums, cand_nums)], dtype=bool)
+        # 片方だけが一番くじなどの景品なら、名前が似ていても別商品
+        kind_conflict = np.array([is_kuji(a) != is_kuji(b) for a, b in zip(master_names[targets], cand_names)], dtype=bool)
+        nums_conflict &= ~kind_conflict
 
         merged_df.loc[targets, '類似度'] = score_text
         merged_df.loc[targets, '一致方法'] = [f'一致なし (最高類似度: {s}%)' for s in score_text]
 
-        ok = (best_score >= threshold) & nums_same
-        demoted = (best_score >= threshold) & ~nums_same & ~nums_conflict
-        review = ~ok & ~nums_conflict & (best_score >= review_threshold)
+        blocked = nums_conflict | kind_conflict
+        ok = (best_score >= threshold) & nums_same & ~blocked
+        demoted = (best_score >= threshold) & ~nums_same & ~blocked
+        review = ~ok & ~blocked & (best_score >= review_threshold)
         conflict = nums_conflict & (best_score >= review_threshold)
+        kuji = kind_conflict & (best_score >= review_threshold)
 
         # 要確認のうち、紛らわしさのないものは自動で確定する（相互最良一致）
         #   - 数字が一致し、類似度が AUTO_REVIEW_MIN 以上
@@ -265,6 +281,8 @@ def match_dataframes(df_master, df_price, threshold=MATCH_THRESHOLD, review_thre
         merged_df.loc[targets[not_closest], '一致方法'] = [
             f'一致なし (候補にもっと近い商品が他にある: {c} / 類似度: {s}%)' for c, s in zip(cand_names[not_closest], score_text[not_closest])]
 
+        merged_df.loc[targets[kuji], '一致方法'] = [
+            f'一致なし (くじ景品とプライズの違い: {c} / 類似度: {s}%)' for c, s in zip(cand_names[kuji], score_text[kuji])]
         merged_df.loc[targets[conflict], '一致方法'] = [
             f'一致なし (数字が違う候補のみ: {c} / 類似度: {s}%)' for c, s in zip(cand_names[conflict], score_text[conflict])]
 
@@ -281,7 +299,7 @@ def match_dataframes(df_master, df_price, threshold=MATCH_THRESHOLD, review_thre
             for s, d in zip(score_text[review], demoted[review])]
 
         print(f"  あいまい一致: {ok.sum()}件 / 自動判定: {auto.sum()}件 / 要確認: {review.sum()}件"
-              f" / 一致なし: {(~ok & ~auto & ~review).sum()}件（うち数字が違う候補のみ {conflict.sum()}件、"
+              f" / 一致なし: {(~ok & ~auto & ~review).sum()}件（うち数字が違う候補のみ {conflict.sum()}件、くじとプライズの違い {kuji.sum()}件、"
               f"候補が一致済み {taken.sum()}件、候補にもっと近い商品あり {not_closest.sum()}件）")
 
     return merged_df
@@ -497,10 +515,16 @@ def load_price_df(gc, sheet_id, tab=EXTRA_PRICE_TAB, label=''):
     df.columns = df.columns.str.strip()
     if EXTRA_STATUS_COL in df.columns:
         df = df[df[EXTRA_STATUS_COL].astype(str).str.strip() != EXTRA_REMOVED]
-    if UPDATED_COL in df.columns:
+    # 作品名が別の列に分かれている表（ムーラン）は、作品名を商品名の前につなげて照合する
+    name_col = next((c for c in df.columns if '商品名' in c), None)
+    if name_col and WORK_COL in df.columns:
+        df[name_col] = [n if (not str(w).strip() or str(w).strip() in str(n)) else f'{str(w).strip()} {n}'
+                        for w, n in zip(df[WORK_COL], df[name_col])]
+    updated_col = next((c for c in df.columns if UPDATED_COL in c), None)  # 「更新日」「更新日時」
+    if updated_col:
         # 同じ商品名が何度も載る記録形式の表では、同名なら最後の行を使うので、更新日の古い順に並べておく
         # 日付として読めない行は先頭（＝古い扱い）にする
-        dates = pd.to_datetime(df[UPDATED_COL].astype(str).str.strip(), errors='coerce', format='mixed')
+        dates = pd.to_datetime(df[updated_col].astype(str).str.strip(), errors='coerce', format='mixed')
         df = df.loc[dates.sort_values(kind='stable', na_position='first').index]
     return df.reset_index(drop=True)
 
