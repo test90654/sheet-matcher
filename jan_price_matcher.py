@@ -2,6 +2,8 @@ import os
 import json
 import re
 import unicodedata
+from datetime import datetime
+from zoneinfo import ZoneInfo
 import gspread
 from google.oauth2.service_account import Credentials
 import numpy as np
@@ -28,6 +30,10 @@ CANDIDATE_COL = '要確認_候補'
 
 # 価格比較タブ：突合で商品名の対応が確定した商品について、各店舗の買取価格を並べる
 COMPARE_SHEET_NAME = '価格比較'
+# 価格比較の履歴：店舗ごとの買取価格が変わったときだけ1行ずつ積み上げる
+HISTORY_SHEET_NAME = '価格比較_履歴'
+HISTORY_HEADER = ['日付', 'JAN', '商品名', '店舗', '店舗側の商品名', '買取価格', '前回価格', '変動']
+GONE = '掲載なし'
 MAIN_LABEL = 'ドラゴンボーン'  # メインの価格表（PRICE_ID）の店舗名
 
 # 追加の買取価格表（店舗ごとに価格列を横に並べる）
@@ -508,16 +514,20 @@ def write_compare(sh, merged_df, jan_col, master_name_col, stores):
     header += ['最高値の店舗', '最高値']
 
     rows = []
+    current = {}  # (キー, 店舗) → (JAN, 商品名, 店舗側の商品名, 価格)。履歴の記録に使う
     for _, r in merged_df.iterrows():
         names = [str(r[col]).strip() for _, col, _ in stores]
         if not any(names):
             continue
-        row = ([str(r[jan_col])] if jan_col else []) + [str(r[master_name_col])]
+        jan = str(r[jan_col]) if jan_col else ''
+        row = ([jan] if jan_col else []) + [str(r[master_name_col])]
         prices = []
         for (label, _, lookup), name in zip(stores, names):
             p = lookup.get(name) if name else None
             row += [name, '' if p is None else p]
             prices.append((label, p))
+            if p is not None:
+                current[(make_key(jan, r[master_name_col]), label)] = (jan, str(r[master_name_col]), name, p)
         known = [(label, p) for label, p in prices if p is not None]
         top = max((p for _, p in known), default=None)
         row += ['・'.join(label for label, p in known if p == top) if top is not None else '', '' if top is None else top]
@@ -525,6 +535,55 @@ def write_compare(sh, merged_df, jan_col, master_name_col, stores):
 
     overwrite_tab(sh, COMPARE_SHEET_NAME, [header] + rows)
     print(f"価格比較: {len(rows)}件")
+    return current
+
+
+def history_changes(history_values, current, labels, today):
+    """前回記録した価格と比べて、変わったものだけを履歴の行にする
+    history_values: 履歴タブの全セル（1行目は見出し） / current: (キー, 店舗) → (JAN, 商品名, 店舗側の商品名, 価格)
+    labels: 今回価格を取得できた店舗（取得できなかった店舗は「掲載なし」にしない）"""
+    last = {}
+    for row in history_values[1:]:
+        row = row + [''] * (len(HISTORY_HEADER) - len(row))
+        key = make_key(row[1], row[2])
+        if key:
+            last[(key, row[3])] = row
+    out = []
+    for k, (jan, name, store_name, price) in current.items():
+        prev = last.get(k)
+        prev_price = parse_price(prev[5]) if prev and prev[7] != GONE else None
+        if prev_price == price:
+            continue
+        if prev_price is None:
+            change = '新規' if prev is None else '再掲載'
+        else:
+            diff = price - prev_price
+            change = f'{diff:+,}'
+        out.append([today, jan, name, k[1], store_name, price, '' if prev_price is None else prev_price, change])
+    # 前回は価格があったのに、今回は載っていない（店の買取表から消えた・一致しなくなった）
+    for k, prev in last.items():
+        if k not in current and k[1] in labels and prev[7] != GONE:
+            out.append([today, prev[1], prev[2], k[1], prev[4], '', parse_price(prev[5]) if prev[5] else '', GONE])
+    return out
+
+
+def write_history(sh, current, labels):
+    """価格比較の履歴タブに、前回から変わった価格だけを追記する"""
+    try:
+        ws = sh.worksheet(HISTORY_SHEET_NAME)
+        values = ws.get_all_values()
+    except gspread.exceptions.WorksheetNotFound:
+        print(f"新しいタブ「{HISTORY_SHEET_NAME}」を作成します...")
+        ws = sh.add_worksheet(title=HISTORY_SHEET_NAME, rows=1000, cols=len(HISTORY_HEADER))
+        values = []
+    if not values:
+        ws.update(range_name='A1', values=[HISTORY_HEADER])
+        values = [HISTORY_HEADER]
+    today = datetime.now(ZoneInfo('Asia/Tokyo')).strftime('%Y-%m-%d')
+    rows = history_changes(values, current, set(labels), today)
+    if rows:
+        ws.append_rows(rows, value_input_option='RAW')  # JANが数値扱いで桁落ちしないよう、そのまま書く
+    print(f"価格比較_履歴: {len(rows)}件を追記しました（履歴の合計 {len(values) - 1 + len(rows)}件）")
 
 
 def sheet_key(value):
@@ -665,7 +724,8 @@ def execute_sheet_matching(master_sheet_id, price_sheet_id, threshold=MATCH_THRE
         write_name_list(master_sh, df_extra, extra_name_col, list_sheet)
         stores.append((label, f'{label}_商品名', price_lookup(df_extra, extra_name_col, label)))
     write_result(master_sh, merged_df, dropdowns)
-    write_compare(master_sh, merged_df, jan_col, master_name_col, stores)
+    current = write_compare(master_sh, merged_df, jan_col, master_name_col, stores)
+    write_history(master_sh, current, [label for label, _, _ in stores])
     print("すべての処理が完了しました！")
 
 
