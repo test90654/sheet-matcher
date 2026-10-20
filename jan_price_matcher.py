@@ -95,9 +95,18 @@ def to_tokens(text):
     text = unicodedata.normalize('NFKC', text).lower()
     # ひらがなはカタカナにそろえる（「ぬーどるストッパー」と「ヌードルストッパー」など）
     text = ''.join(chr(ord(ch) + 0x60) if 'ぁ' <= ch <= 'ゖ' else ch for ch in text)
+    # 「フィギュアー胡蝶しのぶー」のように長音記号がハイフン代わりに使われている表記を区切る（フィギュアーツは除く）
+    text = re.sub(r'フィギュアー(?!ツ)', 'フィギュア ', text)
     # 文字・数字・長音以外（記号・括弧・空白）はすべて区切りにする
     text = ''.join(ch if (unicodedata.category(ch)[0] in 'LN' or ch == 'ー') else ' ' for ch in text)
-    return [t for t in text.split() if t not in NOISE_WORDS]
+    tokens = []
+    for t in text.split():
+        # 「ぬーどるストッパーフィギュア」のように末尾にくっついた「フィギュア」を外す
+        if len(t) > 5 and t.endswith('フィギュア'):
+            t = t[:-5]
+        if t not in NOISE_WORDS:
+            tokens.append(t)
+    return tokens
 
 
 def clean_text(text):
@@ -118,6 +127,32 @@ def is_kuji(text):
     if pd.isna(text) or not isinstance(text, str):
         return False
     return bool(KUJI_PATTERN.search(unicodedata.normalize('NFKC', text).lower()))
+
+
+# プライズ以外（ねんどろいど・figma・スケールフィギュアなど）はマスターにあっても照合しない
+NON_PRIZE_PATTERN = re.compile(
+    r'ねんどろいど|figma|pop up parade|s\.h\.figuarts|フィギュアーツ|artfx|スケールフィギュア|完成品フィギュア|プラモデル|(?<![\d.])1/[4-8](?!\d)')
+EXCLUDE_NON_PRIZE = os.environ.get("EXCLUDE_NON_PRIZE", "1").strip() not in ("0", "false", "")
+
+
+def is_non_prize(text):
+    if pd.isna(text) or not isinstance(text, str):
+        return False
+    t = unicodedata.normalize('NFKC', text).lower()
+    return bool(NON_PRIZE_PATTERN.search(t)) or is_kuji(text)
+
+
+def title_omitted_match(master_name, cand_name, max_title_tokens=3):
+    """店側が作品名を省いているだけか（「呪術廻戦 死滅回游 Luminasta 秤金次」と「Luminasta 秤金次」など）。
+    マスターの先頭の1〜3語を除くと、残りの単語が候補の単語とちょうど同じになるときに True"""
+    m = [t.replace('ー', '') for t in to_tokens(master_name)]
+    c = {t.replace('ー', '') for t in to_tokens(cand_name)}
+    if len(c) < 2:
+        return False
+    k = 0
+    while k < len(m) and m[k] not in c:
+        k += 1
+    return 1 <= k <= max_title_tokens and set(m[k:]) == c
 
 
 def numbers_in(text):
@@ -178,6 +213,12 @@ def match_dataframes(df_master, df_price, threshold=MATCH_THRESHOLD, review_thre
         if missing.any():
             print(f"  価格表に見つからない手動指定: {missing.sum()}件")
         done |= locked
+
+    # プライズ以外（ねんどろいど・一番くじなど）は照合しない
+    if EXCLUDE_NON_PRIZE:
+        excluded = ~done & master_names.map(is_non_prize)
+        merged_df.loc[excluded, '一致方法'] = '対象外 (プライズ以外)'
+        done |= excluded
 
     # 1. 完全一致
     print("商品名による完全一致処理を実行中...")
@@ -274,7 +315,21 @@ def match_dataframes(df_master, df_price, threshold=MATCH_THRESHOLD, review_thre
         # 価格表の1商品には、マスターの1商品だけを結び付ける
         #   - 候補がすでに別のマスター商品と一致済みなら、要確認に出さない
         #   - 候補から見てもっと近いマスター商品が他にあるなら、要確認はそちらだけに出す
-        matched_now = pd.concat([merged_df.loc[done, MATCHED_COL], pd.Series(cand_names[ok | auto])]).astype(str)
+        # 店側が作品名を省いているだけのもの（候補ごとに1件だけ当てはまるとき）は確定する
+        title = ~ok & ~auto & ~blocked & nums_same & np.array(
+            [title_omitted_match(mn, cn) for mn, cn in zip(master_names[targets], cand_names)], dtype=bool)
+        if title.any():
+            per_cand = pd.Series(best_idx[title]).value_counts()
+            title &= np.array([per_cand.get(p, 0) == 1 for p in best_idx], dtype=bool)
+            already = {clean_text(n) for n in merged_df.loc[done, MATCHED_COL].astype(str) if n.strip()}
+            already |= {clean_text(n) for n in cand_names[ok | auto]}
+            title &= np.array([clean_text(c) not in already for c in cand_names], dtype=bool)
+        auto_title = title
+        review &= ~auto_title
+        merged_df.loc[targets[auto_title], MATCHED_COL] = cand_names[auto_title]
+        merged_df.loc[targets[auto_title], '一致方法'] = [f'自動判定: 作品名の省略 (類似度: {s}%)' for s in score_text[auto_title]]
+
+        matched_now = pd.concat([merged_df.loc[done, MATCHED_COL], pd.Series(cand_names[ok | auto | auto_title])]).astype(str)
         claimed = {clean_text(n) for n in matched_now if n.strip()}
         taken = review & np.array([clean_text(c) in claimed for c in cand_names], dtype=bool)
         not_closest = review & ~taken & ~mutual
@@ -301,8 +356,8 @@ def match_dataframes(df_master, df_price, threshold=MATCH_THRESHOLD, review_thre
             f'要確認 (片方にだけ数字あり, 類似度: {s}%)' if d else f'要確認 (類似度: {s}%)'
             for s, d in zip(score_text[review], demoted[review])]
 
-        print(f"  あいまい一致: {ok.sum()}件 / 自動判定: {auto.sum()}件 / 要確認: {review.sum()}件"
-              f" / 一致なし: {(~ok & ~auto & ~review).sum()}件（うち数字が違う候補のみ {conflict.sum()}件、くじとプライズの違い {kuji.sum()}件、"
+        print(f"  あいまい一致: {ok.sum()}件 / 自動判定: {auto.sum()}件 / 作品名の省略: {auto_title.sum()}件 / 要確認: {review.sum()}件"
+              f" / 一致なし: {(~ok & ~auto & ~auto_title & ~review).sum()}件（うち数字が違う候補のみ {conflict.sum()}件、くじとプライズの違い {kuji.sum()}件、"
               f"候補が一致済み {taken.sum()}件、候補にもっと近い商品あり {not_closest.sum()}件）")
 
     return merged_df
