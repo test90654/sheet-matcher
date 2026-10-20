@@ -258,6 +258,7 @@ def write_result(sh, merged_df):
     merged_df = merged_df.fillna('').astype(str)
     data_to_write = [merged_df.columns.tolist()] + merged_df.values.tolist()
     ws = overwrite_tab(sh, OUTPUT_SHEET_NAME, data_to_write)
+    print(f"::notice::result tab written: rows={len(data_to_write)} cols={len(data_to_write[0])} sheet_cols={ws.col_count}")
 
     ci = merged_df.columns.get_loc(MANUAL_COL)
     sh.batch_update({'requests': [{'setDataValidation': {
@@ -305,6 +306,7 @@ def add_extra_prices(merged_df, df_master, df_extra, label, threshold, review_th
     hit = (sub[price_col].astype(str).str.strip() != '').sum()
     review = (sub['要確認_候補価格'].astype(str).str.strip() != '').sum()
     print(f"[{label}] 一致: {hit}件 / 要確認: {review}件 / 価格表 {len(df_extra)}件")
+    print(f"::notice::extra source {len(df_extra)} rows, matched={hit}, review={review}")
     return merged_df
 
 
@@ -333,11 +335,13 @@ def execute_sheet_matching(master_sheet_id, price_sheet_id, threshold=MATCH_THRE
         sheet_id = os.environ.get(env_name, '').strip()
         if not sheet_id:
             print(f"[{label}] {env_name} が未設定のため飛ばします。")
+            print(f"::warning::{env_name} is not set; skipped")
             continue
         print(f"[{label}] 買取価格表を取得しています...")
         df_extra = load_extra_price_df(gc, sheet_id)
         if df_extra.empty:
             print(f"[{label}] 価格表が空のため飛ばします。")
+            print(f"::warning::{env_name}: price sheet is empty; skipped")
             continue
         merged_df = add_extra_prices(merged_df, df_master, df_extra, label, threshold, review_threshold)
 
