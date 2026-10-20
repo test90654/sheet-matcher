@@ -32,6 +32,9 @@ EXTRA_PRICE_TAB = '現在一覧'
 EXTRA_STATUS_COL = '状態'
 EXTRA_REMOVED = '削除'
 
+# タブの右側に残しておく空き列の数
+SPARE_COLS = 5
+
 # あいまい一致を一度に計算する行数（メモリ使用量の上限を抑えるため）
 FUZZY_CHUNK_SIZE = 1000
 
@@ -183,11 +186,12 @@ def overwrite_tab(sh, title, data_to_write):
         ws = sh.worksheet(title)
         print(f"既存のタブ「{title}」の内容を上書きしています...")
         ws.clear()
-        if ws.row_count < rows or ws.col_count < cols:
-            ws.resize(rows=max(ws.row_count, rows), cols=max(ws.col_count, cols))
+        # 右側に余白の列を残しておく（列を広げたり、メモ用の列を足したりできるように）
+        if ws.row_count < rows or ws.col_count < cols + SPARE_COLS:
+            ws.resize(rows=max(ws.row_count, rows), cols=max(ws.col_count, cols + SPARE_COLS))
     except gspread.exceptions.WorksheetNotFound:
         print(f"新しいタブ「{title}」を作成して書き込んでいます...")
-        ws = sh.add_worksheet(title=title, rows=rows + 10, cols=cols + 5)
+        ws = sh.add_worksheet(title=title, rows=rows + 10, cols=cols + SPARE_COLS)
 
     ws.update(range_name='A1', values=data_to_write)
     return ws
