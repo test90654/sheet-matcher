@@ -35,6 +35,8 @@ MAIN_LABEL = 'ドラゴンボーン'  # メインの価格表（PRICE_ID）の�
 EXTRA_PRICE_SOURCES = [
     ('千葉鑑定団', 'CHIBAKAN_PRICE_ID'),
     ('らしんばん', 'LASHINBANG_PRICE_ID'),
+    # twitter-rss-discord-bot の承認ダッシュボードが書く形式（sheet1、ジャンル/商品名/価格/更新日/型番・JAN）
+    ('ムーラン', 'MOULIN_PRICE_ID'),
 ]
 EXTRA_PRICE_TAB = '現在一覧'
 
@@ -45,6 +47,7 @@ def extra_names(label):
 
 EXTRA_STATUS_COL = '状態'
 EXTRA_REMOVED = '削除'
+UPDATED_COL = '更新日'
 
 # タブの右側に残しておく空き列の数
 SPARE_COLS = 5
@@ -359,6 +362,11 @@ def load_price_df(gc, sheet_id):
     df.columns = df.columns.str.strip()
     if EXTRA_STATUS_COL in df.columns:
         df = df[df[EXTRA_STATUS_COL].astype(str).str.strip() != EXTRA_REMOVED]
+    if UPDATED_COL in df.columns:
+        # 同じ商品名が何度も載る記録形式の表では、同名なら最後の行を使うので、更新日の古い順に並べておく
+        # 日付として読めない行は先頭（＝古い扱い）にする
+        dates = pd.to_datetime(df[UPDATED_COL].astype(str).str.strip(), errors='coerce', format='mixed')
+        df = df.loc[dates.sort_values(kind='stable', na_position='first').index]
     return df.reset_index(drop=True)
 
 
