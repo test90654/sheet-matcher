@@ -22,6 +22,16 @@ LIST_SHEET_NAME = '価格表_商品名リスト'
 MANUAL_COL = '手動指定'
 NO_MATCH = '(一致させない)'
 
+# 追加の買取価格表（店舗ごとに価格列を横に並べる）
+# (列名の接頭辞, スプレッドシートIDの環境変数名)。IDが未設定の店舗は飛ばす。
+# figure-kaitori-bot の形式（「現在一覧」タブ、状態=削除 の行は対象外）を想定。
+EXTRA_PRICE_SOURCES = [
+    ('千葉鑑定団', 'CHIBAKAN_PRICE_ID'),
+]
+EXTRA_PRICE_TAB = '現在一覧'
+EXTRA_STATUS_COL = '状態'
+EXTRA_REMOVED = '削除'
+
 # あいまい一致を一度に計算する行数（メモリ使用量の上限を抑えるため）
 FUZZY_CHUNK_SIZE = 1000
 
@@ -262,6 +272,42 @@ def write_result(sh, merged_df):
     }}]})
 
 
+def load_extra_price_df(gc, sheet_id):
+    """追加店舗の価格表を読む。「現在一覧」タブがなければ最初のタブ。掲載終了(削除)の行は除く"""
+    sh = gc.open_by_key(sheet_id)
+    try:
+        ws = sh.worksheet(EXTRA_PRICE_TAB)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sh.get_worksheet(0)
+    df = pd.DataFrame(ws.get_all_records())
+    if df.empty:
+        return df
+    df.columns = df.columns.str.strip()
+    if EXTRA_STATUS_COL in df.columns:
+        df = df[df[EXTRA_STATUS_COL].astype(str).str.strip() != EXTRA_REMOVED]
+    return df.reset_index(drop=True)
+
+
+def add_extra_prices(merged_df, df_master, df_extra, label, threshold, review_threshold):
+    """追加店舗の価格表と突合し、「<店舗>_買取価格」などの列を結果の右側に追加する
+    （手動指定はメインの価格表用なので、ここでは使わない）"""
+    jan_col, master_name_col, _, _ = find_columns(df_master, df_extra)
+    keep = [c for c in (jan_col, master_name_col) if c]
+    # マスターの他の列と価格列の名前がぶつからないよう、JANと商品名だけで突合する
+    sub = match_dataframes(df_master[keep].copy(), df_extra, threshold, review_threshold)
+    price_col = find_columns(df_master, df_extra)[3]
+
+    merged_df[f'{label}_買取価格'] = sub[price_col].values
+    merged_df[f'{label}_要確認_候補価格'] = sub['要確認_候補価格'].values
+    merged_df[f'{label}_商品名'] = sub['価格表側の商品名'].values
+    merged_df[f'{label}_一致方法'] = sub['一致方法'].values
+
+    hit = (sub[price_col].astype(str).str.strip() != '').sum()
+    review = (sub['要確認_候補価格'].astype(str).str.strip() != '').sum()
+    print(f"[{label}] 一致: {hit}件 / 要確認: {review}件 / 価格表 {len(df_extra)}件")
+    return merged_df
+
+
 def execute_sheet_matching(master_sheet_id, price_sheet_id, threshold=MATCH_THRESHOLD, review_threshold=REVIEW_THRESHOLD):
     gc = get_client()
     print("Googleスプレッドシートからデータを取得しています...")
@@ -282,6 +328,18 @@ def execute_sheet_matching(master_sheet_id, price_sheet_id, threshold=MATCH_THRE
     manual = load_manual(master_sh, jan_col, master_name_col)
 
     merged_df = match_dataframes(df_master, df_price, threshold, review_threshold, manual)
+
+    for label, env_name in EXTRA_PRICE_SOURCES:
+        sheet_id = os.environ.get(env_name, '').strip()
+        if not sheet_id:
+            print(f"[{label}] {env_name} が未設定のため飛ばします。")
+            continue
+        print(f"[{label}] 買取価格表を取得しています...")
+        df_extra = load_extra_price_df(gc, sheet_id)
+        if df_extra.empty:
+            print(f"[{label}] 価格表が空のため飛ばします。")
+            continue
+        merged_df = add_extra_prices(merged_df, df_master, df_extra, label, threshold, review_threshold)
 
     # 結果タブを上書きする前に、取り込んだ手動指定を保存しておく
     save_manual(master_sh, manual, merged_df, jan_col, master_name_col)
