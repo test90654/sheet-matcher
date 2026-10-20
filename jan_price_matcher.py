@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import unicodedata
 import gspread
 from google.oauth2.service_account import Credentials
 import numpy as np
@@ -72,13 +73,43 @@ def get_client():
     return gspread.authorize(creds)
 
 
-def clean_text(text):
-    """商品名の比較精度を上げるための正規化処理"""
+# 店舗によって付いたり付かなかったりする、商品の区別に関係ない語（単語として独立しているときだけ取り除く）
+NOISE_WORDS = {'フィギュア', 'figure', 'プライズ', 'prize', 'プライズフィギュア', '景品', '新作', '新弾', '新商品', 'new'}
+
+# 要確認の候補を自動で確定させる条件（相互最良一致）
+# ・類似度がこの値以上
+# ・2番目に近い候補との差がこの値以上（紛らわしい候補がない）
+AUTO_REVIEW_MIN = float(os.environ.get("AUTO_REVIEW_MIN", 90))
+AUTO_REVIEW_MARGIN = float(os.environ.get("AUTO_REVIEW_MARGIN", 5))
+
+
+def to_tokens(text):
+    """商品名を単語に分ける。NFKCで全角半角・半角カナ・丸数字などを揃え、記号は区切りとして扱う"""
     if pd.isna(text) or not isinstance(text, str):
-        return ""
-    text = re.sub(r'[Ａ-Ｚａ-ｚ０-９]', lambda s: chr(ord(s.group(0)) - 0xFEE0), text)
-    text = re.sub(r'[\s \-\ー\(\)（）\[\]【】]', '', text)
-    return text.lower()
+        return []
+    text = unicodedata.normalize('NFKC', text).lower()
+    # ひらがなはカタカナにそろえる（「ぬーどるストッパー」と「ヌードルストッパー」など）
+    text = ''.join(chr(ord(ch) + 0x60) if 'ぁ' <= ch <= 'ゖ' else ch for ch in text)
+    # 文字・数字・長音以外（記号・括弧・空白）はすべて区切りにする
+    text = ''.join(ch if (unicodedata.category(ch)[0] in 'LN' or ch == 'ー') else ' ' for ch in text)
+    return [t for t in text.split() if t not in NOISE_WORDS]
+
+
+def clean_text(text):
+    """商品名の比較精度を上げるための正規化処理（記号・空白を除いて詰めた文字列）"""
+    return ''.join(to_tokens(text)).replace('ー', '')
+
+
+def sorted_tokens(text):
+    """語順の違いを吸収するため、単語を並べ替えてつないだ文字列"""
+    return ' '.join(sorted(t.replace('ー', '') for t in to_tokens(text)))
+
+
+def numbers_in(text):
+    """商品名に含まれる数字（Vol.2・第3弾・A賞②など）。数字だけが違う別商品の取り違えを防ぐのに使う"""
+    if pd.isna(text) or not isinstance(text, str):
+        return ()
+    return tuple(sorted(int(n) for n in re.findall(r'\d+', unicodedata.normalize('NFKC', text))))
 
 
 def find_columns(df_master, df_price):
@@ -150,40 +181,100 @@ def match_dataframes(df_master, df_price, threshold=MATCH_THRESHOLD, review_thre
         merged_df.loc[hit, MATCHED_COL] = master_cleaned[hit].map(cleaned_price_dict)
         done |= hit
 
+    # 2b. 語順ちがいの完全一致（店舗によって「キャラ名 作品名」「作品名 キャラ名」の順が違うため）
+    if (~done).any():
+        master_sorted = master_names.map(sorted_tokens)
+        price_sorted = price_names.map(sorted_tokens)
+        valid = price_sorted != ''
+        sorted_price_dict = dict(zip(price_sorted[valid], price_names[valid]))
+        hit = ~done & (master_sorted != '') & master_sorted.isin(sorted_price_dict.keys())
+        merged_df.loc[hit, '一致方法'] = '語順ちがいの完全一致'
+        merged_df.loc[hit, MATCHED_COL] = master_sorted[hit].map(sorted_price_dict)
+        done |= hit
+
     # 3. 厳格あいまい一致（全CPUでまとめて計算）
     targets = merged_df.index[~done & (master_cleaned != '')]
-    if len(targets) > 0 and len(df_price) > 0:
+    if len(targets) > 0 and (price_cleaned != '').any():
         print(f"残りの {len(targets)} 件について、しきい値 {threshold:g}% 以上（{review_threshold:g}% 以上は要確認）の厳格なあいまい検索を実行します...")
-        choices = price_cleaned.tolist()
+        # 同じ商品が何行も載っている価格表（記録形式など）で2番目の候補が同点にならないよう、正規化後の名前で重複を除く
+        uniq = price_cleaned[price_cleaned != ''].drop_duplicates(keep='last')
+        u_names = price_names[uniq.index]
+        choices = uniq.tolist()
+        choices_sorted = u_names.map(sorted_tokens).tolist()
+        master_sorted_all = master_names.map(sorted_tokens)
         best_idx = np.empty(len(targets), dtype=np.int64)
         best_score = np.empty(len(targets), dtype=np.float64)
+        second_score = np.zeros(len(targets), dtype=np.float64)
         for start in range(0, len(targets), FUZZY_CHUNK_SIZE):
-            chunk = master_cleaned[targets[start:start + FUZZY_CHUNK_SIZE]].tolist()
-            scores = process.cdist(chunk, choices, scorer=fuzz.WRatio, dtype=np.float32, workers=-1)
-            best_idx[start:start + len(chunk)] = scores.argmax(axis=1)
-            best_score[start:start + len(chunk)] = scores.max(axis=1)
+            rows = targets[start:start + FUZZY_CHUNK_SIZE]
+            scores = combined_scores(master_cleaned[rows].tolist(), master_sorted_all[rows].tolist(), choices, choices_sorted)
+            n = len(rows)
+            best_idx[start:start + n] = scores.argmax(axis=1)
+            best_score[start:start + n] = scores.max(axis=1)
+            if scores.shape[1] > 1:
+                second_score[start:start + n] = np.partition(scores, -2, axis=1)[:, -2]
             print(f"  {min(start + FUZZY_CHUNK_SIZE, len(targets))}/{len(targets)} 件完了")
 
         best_score = best_score.round(1)
-        cand_names = price_names.to_numpy()[best_idx]
-        score_text = [f'{s:g}' for s in best_score]
+        cand_names = u_names.to_numpy()[best_idx]
+        score_text = np.array([f'{s:g}' for s in best_score], dtype=object)
+
+        # 数字（Vol.・第○弾・○賞など）が食い違う候補は、文字が似ていても別商品として自動では確定させない
+        master_nums = [numbers_in(n) for n in master_names[targets]]
+        cand_nums = [numbers_in(n) for n in cand_names]
+        nums_same = np.array([a == b for a, b in zip(master_nums, cand_nums)], dtype=bool)
+        # 両方に数字があって食い違う（第1弾と第2弾など）なら、別商品と判断して要確認にも出さない
+        # 片方にしか数字がない場合は判断できないので要確認に残す
+        nums_conflict = np.array([bool(a) and bool(b) and a != b for a, b in zip(master_nums, cand_nums)], dtype=bool)
 
         merged_df.loc[targets, '類似度'] = score_text
         merged_df.loc[targets, '一致方法'] = [f'一致なし (最高類似度: {s}%)' for s in score_text]
 
-        ok = best_score >= threshold
-        review = ~ok & (best_score >= review_threshold)
+        ok = (best_score >= threshold) & nums_same
+        demoted = (best_score >= threshold) & ~nums_same & ~nums_conflict
+        review = ~ok & ~nums_conflict & (best_score >= review_threshold)
+        conflict = nums_conflict & (best_score >= review_threshold)
+
+        # 要確認のうち、紛らわしさのないものは自動で確定する（相互最良一致）
+        #   - 数字が一致し、類似度が AUTO_REVIEW_MIN 以上
+        #   - 2番目の候補より AUTO_REVIEW_MARGIN 以上高い
+        #   - 価格表側から見ても、マスターでいちばん近いのがこの商品（まだ載っていない新商品が、旧作に誤って結び付くのを防ぐ）
+        auto = review & nums_same & (best_score >= AUTO_REVIEW_MIN) & (best_score - second_score >= AUTO_REVIEW_MARGIN)
+        if auto.any():
+            cand_pos = np.unique(best_idx[auto])
+            back = combined_scores(uniq.iloc[cand_pos].tolist(), u_names.iloc[cand_pos].map(sorted_tokens).tolist(),
+                                   master_cleaned.tolist(), master_sorted_all.tolist())
+            back_best = dict(zip(cand_pos, merged_df.index.to_numpy()[back.argmax(axis=1)]))
+            mutual = np.array([back_best.get(p) == t for p, t in zip(best_idx, targets)], dtype=bool)
+            auto &= mutual
+        review &= ~auto
+
+        merged_df.loc[targets[conflict], '一致方法'] = [
+            f'一致なし (数字が違う候補のみ: {c} / 類似度: {s}%)' for c, s in zip(cand_names[conflict], score_text[conflict])]
 
         merged_df.loc[targets[ok], MATCHED_COL] = cand_names[ok]
-        merged_df.loc[targets[ok], '一致方法'] = [f'厳格あいまい一致 (類似度: {s}%)' for s in np.array(score_text)[ok]]
+        merged_df.loc[targets[ok], '一致方法'] = [f'厳格あいまい一致 (類似度: {s}%)' for s in score_text[ok]]
+
+        merged_df.loc[targets[auto], MATCHED_COL] = cand_names[auto]
+        merged_df.loc[targets[auto], '一致方法'] = [f'自動判定: 相互最良一致 (類似度: {s}%)' for s in score_text[auto]]
 
         # 要確認は確定させず、候補として別の列に出す
         merged_df.loc[targets[review], CANDIDATE_COL] = cand_names[review]
-        merged_df.loc[targets[review], '一致方法'] = [f'要確認 (類似度: {s}%)' for s in np.array(score_text)[review]]
+        merged_df.loc[targets[review], '一致方法'] = [
+            f'要確認 (片方にだけ数字あり, 類似度: {s}%)' if d else f'要確認 (類似度: {s}%)'
+            for s, d in zip(score_text[review], demoted[review])]
 
-        print(f"  あいまい一致: {ok.sum()}件 / 要確認: {review.sum()}件 / 一致なし: {(~ok & ~review).sum()}件")
+        print(f"  あいまい一致: {ok.sum()}件 / 自動判定: {auto.sum()}件 / 要確認: {review.sum()}件"
+              f" / 一致なし: {(~ok & ~auto & ~review).sum()}件（うち数字が違う候補のみ {conflict.sum()}件）")
 
     return merged_df
+
+
+def combined_scores(queries, queries_sorted, choices, choices_sorted):
+    """詰めた文字列どうしの類似度と、語順をそろえた文字列どうしの類似度の、高いほうを使う"""
+    a = process.cdist(queries, choices, scorer=fuzz.WRatio, dtype=np.float32, workers=-1)
+    b = process.cdist(queries_sorted, choices_sorted, scorer=fuzz.ratio, dtype=np.float32, workers=-1)
+    return np.maximum(a, b)
 
 
 def overwrite_tab(sh, title, data_to_write):
