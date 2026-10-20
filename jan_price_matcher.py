@@ -240,15 +240,30 @@ def match_dataframes(df_master, df_price, threshold=MATCH_THRESHOLD, review_thre
         #   - 数字が一致し、類似度が AUTO_REVIEW_MIN 以上
         #   - 2番目の候補より AUTO_REVIEW_MARGIN 以上高い
         #   - 価格表側から見ても、マスターでいちばん近いのがこの商品（まだ載っていない新商品が、旧作に誤って結び付くのを防ぐ）
-        auto = review & nums_same & (best_score >= AUTO_REVIEW_MIN) & (best_score - second_score >= AUTO_REVIEW_MARGIN)
-        if auto.any():
-            cand_pos = np.unique(best_idx[auto])
+        # 価格表側から見て、マスターでいちばん近い商品（相互最良の判定に使う）
+        mutual = np.zeros(len(targets), dtype=bool)
+        if review.any():
+            cand_pos = np.unique(best_idx[review])
             back = combined_scores(uniq.iloc[cand_pos].tolist(), u_names.iloc[cand_pos].map(sorted_tokens).tolist(),
                                    master_cleaned.tolist(), master_sorted_all.tolist())
             back_best = dict(zip(cand_pos, merged_df.index.to_numpy()[back.argmax(axis=1)]))
             mutual = np.array([back_best.get(p) == t for p, t in zip(best_idx, targets)], dtype=bool)
-            auto &= mutual
+
+        auto = review & nums_same & mutual & (best_score >= AUTO_REVIEW_MIN) & (best_score - second_score >= AUTO_REVIEW_MARGIN)
         review &= ~auto
+
+        # 価格表の1商品には、マスターの1商品だけを結び付ける
+        #   - 候補がすでに別のマスター商品と一致済みなら、要確認に出さない
+        #   - 候補から見てもっと近いマスター商品が他にあるなら、要確認はそちらだけに出す
+        matched_now = pd.concat([merged_df.loc[done, MATCHED_COL], pd.Series(cand_names[ok | auto])]).astype(str)
+        claimed = {clean_text(n) for n in matched_now if n.strip()}
+        taken = review & np.array([clean_text(c) in claimed for c in cand_names], dtype=bool)
+        not_closest = review & ~taken & ~mutual
+        review &= ~taken & ~not_closest
+        merged_df.loc[targets[taken], '一致方法'] = [
+            f'一致なし (候補は別の商品と一致済み: {c} / 類似度: {s}%)' for c, s in zip(cand_names[taken], score_text[taken])]
+        merged_df.loc[targets[not_closest], '一致方法'] = [
+            f'一致なし (候補にもっと近い商品が他にある: {c} / 類似度: {s}%)' for c, s in zip(cand_names[not_closest], score_text[not_closest])]
 
         merged_df.loc[targets[conflict], '一致方法'] = [
             f'一致なし (数字が違う候補のみ: {c} / 類似度: {s}%)' for c, s in zip(cand_names[conflict], score_text[conflict])]
@@ -266,7 +281,8 @@ def match_dataframes(df_master, df_price, threshold=MATCH_THRESHOLD, review_thre
             for s, d in zip(score_text[review], demoted[review])]
 
         print(f"  あいまい一致: {ok.sum()}件 / 自動判定: {auto.sum()}件 / 要確認: {review.sum()}件"
-              f" / 一致なし: {(~ok & ~auto & ~review).sum()}件（うち数字が違う候補のみ {conflict.sum()}件）")
+              f" / 一致なし: {(~ok & ~auto & ~review).sum()}件（うち数字が違う候補のみ {conflict.sum()}件、"
+              f"候補が一致済み {taken.sum()}件、候補にもっと近い商品あり {not_closest.sum()}件）")
 
     return merged_df
 
@@ -441,6 +457,29 @@ def sheet_key(value):
     return m.group(1) if m else value.strip()
 
 
+def records_df(values):
+    """シートの値（1行目が見出し）をDataFrameにする。見出しが空の列は捨て、同じ見出しが重複したら後ろに _2, _3 を付ける
+    （get_all_records は見出しの空欄や重複があるとエラーになるため）"""
+    if not values:
+        return pd.DataFrame()
+    header = [str(h).strip() for h in values[0]]
+    keep, names, seen = [], [], {}
+    for i, h in enumerate(header):
+        if not h:
+            continue
+        seen[h] = seen.get(h, 0) + 1
+        keep.append(i)
+        names.append(h if seen[h] == 1 else f'{h}_{seen[h]}')
+    rows = [[(r[i] if i < len(r) else '') for i in keep] for r in values[1:]]
+    rows = [r for r in rows if any(str(v).strip() for v in r)]
+    df = pd.DataFrame(rows, columns=names)
+    # get_all_records と同じく、数字だけのセルは数値にする（JANなどの先頭0が消えないよう、変換は価格の列だけ）
+    for c in df.columns:
+        if '価格' in c:
+            df[c] = df[c].map(lambda v: parse_price(v) if str(v).strip() else '')
+    return df
+
+
 def load_price_df(gc, sheet_id, tab=EXTRA_PRICE_TAB, label=''):
     """価格表を読む。指定のタブがなければ最初のタブ。掲載終了(削除)の行は除く"""
     sh = gc.open_by_key(sheet_key(sheet_id))
@@ -451,7 +490,7 @@ def load_price_df(gc, sheet_id, tab=EXTRA_PRICE_TAB, label=''):
         tabs = [w.title for w in sh.worksheets()]
         print(f"[{label}] 「{tab}」タブがないため、最初のタブ「{ws.title}」を読みます（タブ一覧: {tabs}）")
         print(f"::warning::{label}: tab '{tab}' not found; read '{ws.title}' instead. tabs={tabs}")
-    df = pd.DataFrame(ws.get_all_records())
+    df = records_df(ws.get_all_values())
     print(f"[{label}] タブ「{ws.title}」: {len(df)}行 / 列 {list(df.columns)}")
     if df.empty:
         return df
