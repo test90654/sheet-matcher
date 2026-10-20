@@ -84,6 +84,9 @@ NOISE_WORDS = {'フィギュア', 'figure', 'プライズ', 'prize', 'プライ�
 AUTO_REVIEW_MIN = float(os.environ.get("AUTO_REVIEW_MIN", 90))
 AUTO_REVIEW_MARGIN = float(os.environ.get("AUTO_REVIEW_MARGIN", 5))
 
+# 一番くじなどのくじ景品は扱わないので、価格表から照合の前に取り除く（0 にすると残す）
+EXCLUDE_KUJI = os.environ.get("EXCLUDE_KUJI", "1").strip() not in ("0", "false", "")
+
 
 def to_tokens(text):
     """商品名を単語に分ける。NFKCで全角半角・半角カナ・丸数字などを揃え、記号は区切りとして扱う"""
@@ -520,6 +523,11 @@ def load_price_df(gc, sheet_id, tab=EXTRA_PRICE_TAB, label=''):
     if name_col and WORK_COL in df.columns:
         df[name_col] = [n if (not str(w).strip() or str(w).strip() in str(n)) else f'{str(w).strip()} {n}'
                         for w, n in zip(df[WORK_COL], df[name_col])]
+    if EXCLUDE_KUJI and name_col:
+        kuji_rows = df[name_col].map(is_kuji)
+        if kuji_rows.any():
+            print(f"[{label}] 一番くじなどのくじ景品 {kuji_rows.sum()}行を除きました")
+            df = df[~kuji_rows]
     updated_col = next((c for c in df.columns if UPDATED_COL in c), None)  # 「更新日」「更新日時」
     if updated_col:
         # 同じ商品名が何度も載る記録形式の表では、同名なら最後の行を使うので、更新日の古い順に並べておく
