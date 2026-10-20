@@ -34,6 +34,7 @@ MAIN_LABEL = 'ドラゴンボーン'  # メインの価格表（PRICE_ID）の�
 # figure-kaitori-bot の形式（「現在一覧」タブ、状態=削除 の行は対象外）を想定。
 EXTRA_PRICE_SOURCES = [
     ('千葉鑑定団', 'CHIBAKAN_PRICE_ID'),
+    ('らしんばん', 'LASHINBANG_PRICE_ID'),
 ]
 EXTRA_PRICE_TAB = '現在一覧'
 
@@ -339,9 +340,15 @@ def write_compare(sh, merged_df, jan_col, master_name_col, stores):
     print(f"価格比較: {len(rows)}件")
 
 
-def load_extra_price_df(gc, sheet_id):
-    """追加店舗の価格表を読む。「現在一覧」タブがなければ最初のタブ。掲載終了(削除)の行は除く"""
-    sh = gc.open_by_key(sheet_id)
+def sheet_key(value):
+    """スプレッドシートのIDを取り出す（URLを丸ごと渡されてもよい）"""
+    m = re.search(r'/spreadsheets/d/([A-Za-z0-9_-]+)', value)
+    return m.group(1) if m else value.strip()
+
+
+def load_price_df(gc, sheet_id):
+    """価格表を読む。「現在一覧」タブがなければ最初のタブ。掲載終了(削除)の行は除く"""
+    sh = gc.open_by_key(sheet_key(sheet_id))
     try:
         ws = sh.worksheet(EXTRA_PRICE_TAB)
     except gspread.exceptions.WorksheetNotFound:
@@ -379,14 +386,14 @@ def execute_sheet_matching(master_sheet_id, price_sheet_id, threshold=MATCH_THRE
     gc = get_client()
     print("Googleスプレッドシートからデータを取得しています...")
 
-    master_sh = gc.open_by_key(master_sheet_id)
-    price_sh = gc.open_by_key(price_sheet_id)
-
+    master_sh = gc.open_by_key(sheet_key(master_sheet_id))
     df_master = pd.DataFrame(master_sh.get_worksheet(0).get_all_records())
-    df_price = pd.DataFrame(price_sh.get_worksheet(0).get_all_records())
-
     df_master.columns = df_master.columns.str.strip()
-    df_price.columns = df_price.columns.str.strip()
+
+    # メインの価格表も追加店舗と同じく「現在一覧」タブ（なければ最初のタブ）から、削除済みを除いて読む
+    df_price = load_price_df(gc, price_sheet_id)
+    if df_price.empty:
+        raise ValueError("メインの価格表が空です。PRICE_ID のスプレッドシートを確認してください。")
 
     print(f"マスターデータ件数: {len(df_master)}件")
     print(f"買取価格表件数: {len(df_price)}件")
@@ -405,7 +412,7 @@ def execute_sheet_matching(master_sheet_id, price_sheet_id, threshold=MATCH_THRE
             print(f"::warning::{env_name} is not set; skipped")
             continue
         print(f"[{label}] 買取価格表を取得しています...")
-        df_extra = load_extra_price_df(gc, sheet_id)
+        df_extra = load_price_df(gc, sheet_id)
         if df_extra.empty:
             print(f"[{label}] 価格表が空のため飛ばします。")
             print(f"::warning::{env_name}: price sheet is empty; skipped")
