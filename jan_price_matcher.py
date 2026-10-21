@@ -563,9 +563,75 @@ def write_compare(sh, merged_df, jan_col, master_name_col, stores):
         row += ['・'.join(label for label, p in known if p == top) if top is not None else '', '' if top is None else top]
         rows.append(row)
 
-    overwrite_tab(sh, COMPARE_SHEET_NAME, [header] + rows)
+    ws = overwrite_tab(sh, COMPARE_SHEET_NAME, [header] + rows)
+    try:
+        highlight_top(sh, ws, header, [label for label, _, _ in stores])
+    except Exception as e:  # 色付けに失敗しても、価格比較の書き出し自体は済んでいるので止めない
+        print(f"::warning::価格比較の色付けに失敗しました: {e}")
     print(f"価格比較: {len(rows)}件")
     return current
+
+
+# 価格比較タブの色付け。自分で付けたルールだけを見分けて付け直すための目印（N("文字") は 0 になるので式の結果に影響しない）
+HIGHLIGHT_MARK = 'N("最高値ハイライト")=0'
+HIGHLIGHT_BG = {'red': 0.80, 'green': 0.93, 'blue': 0.80}
+HIGHLIGHT_TEXT = {'red': 0.05, 'green': 0.40, 'blue': 0.15}
+
+
+def col_letter(i):
+    """0始まりの列番号 → A, B, …, Z, AA"""
+    s = ''
+    i += 1
+    while i:
+        i, r = divmod(i - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def highlight_requests(sheet_id, header, labels, existing_rules):
+    """最高値の店舗の「商品名」「買取価格」のセルを緑にする条件付き書式のリクエスト
+    existing_rules: そのタブに今付いている条件付き書式（自分で付けたものだけ消して付け直す）"""
+    requests = []
+    # 消すときは後ろから（番号がずれないように）
+    for i in reversed(range(len(existing_rules))):
+        values = existing_rules[i].get('booleanRule', {}).get('condition', {}).get('values', [])
+        if any(HIGHLIGHT_MARK in v.get('userEnteredValue', '') for v in values):
+            requests.append({'deleteConditionalFormatRule': {'sheetId': sheet_id, 'index': i}})
+    if '最高値' not in header:
+        return requests
+    top = col_letter(header.index('最高値'))
+    for label in labels:
+        name_col, price_col = f'{label}_商品名', f'{label}_買取価格'
+        if price_col not in header:
+            continue
+        pi = header.index(price_col)
+        ni = header.index(name_col) if name_col in header else pi
+        p = col_letter(pi)
+        requests.append({'addConditionalFormatRule': {'index': 0, 'rule': {
+            'ranges': [{'sheetId': sheet_id, 'startRowIndex': 1,
+                        'startColumnIndex': min(ni, pi), 'endColumnIndex': max(ni, pi) + 1}],
+            'booleanRule': {
+                'condition': {'type': 'CUSTOM_FORMULA', 'values': [
+                    {'userEnteredValue': f'=AND({HIGHLIGHT_MARK}, ISNUMBER(${p}2), ${p}2=${top}2)'}]},
+                'format': {'backgroundColor': HIGHLIGHT_BG,
+                           'textFormat': {'bold': True, 'foregroundColor': HIGHLIGHT_TEXT}},
+            },
+        }}})
+    # 見出し行と商品名の列までを固定して、横にスクロールしても商品名が見えるようにする
+    frozen_cols = header.index('商品名') + 1 if '商品名' in header else 1
+    requests.append({'updateSheetProperties': {
+        'properties': {'sheetId': sheet_id, 'gridProperties': {'frozenRowCount': 1, 'frozenColumnCount': frozen_cols}},
+        'fields': 'gridProperties.frozenRowCount,gridProperties.frozenColumnCount'}})
+    return requests
+
+
+def highlight_top(sh, ws, header, labels):
+    meta = sh.fetch_sheet_metadata({'fields': 'sheets(properties(sheetId),conditionalFormats)'})
+    existing = next((sht.get('conditionalFormats', []) for sht in meta.get('sheets', [])
+                     if sht.get('properties', {}).get('sheetId') == ws.id), [])
+    requests = highlight_requests(ws.id, header, labels, existing)
+    if requests:
+        sh.batch_update({'requests': requests})
 
 
 def history_changes(history_values, current, labels, today):
