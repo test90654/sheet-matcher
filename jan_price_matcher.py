@@ -161,6 +161,41 @@ def title_omitted_match(master_name, cand_name, max_title_tokens=3):
     return 1 <= k <= max_title_tokens and set(m[k:]) == c
 
 
+# プライズのシリーズ名（商品の種類）。シリーズ名が食い違う組は、名前が似ていても自動では確定しない
+# マスターのスプレッドシートに「シリーズ名」タブ（A列に1行1語）を作ると、そこに書いた語も使う
+SERIES_SHEET_NAME = 'シリーズ名'
+DEFAULT_SERIES_WORDS = [
+    'るかっぷ', 'ぬーどるストッパー', 'ちょこのせ', 'ひっかけ', 'おひるね', 'ぽてっと', 'でふぉめいと', 'もちもち',
+    'Luminasta', 'FIGURIZM', 'Coreful', 'Trio-Try-iT', 'BiCute Bunnies', 'Exc∞d Creative', 'GLITTER&GLAMOURS',
+    'Q posket', 'DXF', 'SPM', 'Desktop Cute', 'Relax time', 'ESPRESTO', 'VIBRATION STARS', 'KING OF ARTIST',
+    'TENITOL', 'Xstellar', 'AQUA FLOAT GIRLS', 'ぺたん娘', 'G×materia', 'BLOOD OF SAIYANS', 'THE AMAZING HEROES',
+    'BATTLE RECORD COLLECTION', 'MASTER STARS PIECE', 'マスターライズ', '戦光絶景', 'ワールドコレクタブル', 'WCF',
+    'SOFVIMATES', 'ジオラマティック', 'GRANDISTA', 'Creator×Creator',
+    'フィギュアライズラボ', 'POP UP PARADE', 'BUZZmod', 'Noodle Stopper',
+    'Celestial vivi', 'Aqua Float', 'ChiCute', 'Sweetiny', 'ふわぷち', 'ちびぐるみ', 'メガジャンボ', '発光ヘッド',
+]
+SERIES_KEYS = set()  # 下の set_series_words で設定する
+SERIES_DISPLAY = {}  # 正規化した語 → 表示用の元の語
+
+
+def set_series_words(words):
+    """シリーズ名を正規化して照合用に持つ（短すぎる語は誤検出のもとなので3文字以上だけ）"""
+    global SERIES_KEYS, SERIES_DISPLAY
+    SERIES_DISPLAY = {}
+    for w in words:
+        k = clean_text(str(w))
+        if len(k) >= 3:
+            SERIES_DISPLAY.setdefault(k, str(w).strip())
+    SERIES_KEYS = set(SERIES_DISPLAY)
+
+
+def series_in(text):
+    """商品名に含まれるシリーズ名（ほかのシリーズ名の一部になっているものは除く）"""
+    c = clean_text(text)
+    found = {k for k in SERIES_KEYS if k in c}
+    return frozenset(k for k in found if not any(k != o and k in o for o in found))
+
+
 def numbers_in(text):
     """商品名に含まれる数字（Vol.2・第3弾・A賞②など）。数字だけが違う別商品の取り違えを防ぐのに使う"""
     if pd.isna(text) or not isinstance(text, str):
@@ -291,16 +326,25 @@ def match_dataframes(df_master, df_price, threshold=MATCH_THRESHOLD, review_thre
         # 片方だけが一番くじなどの景品なら、名前が似ていても別商品
         kind_conflict = np.array([is_kuji(a) != is_kuji(b) for a, b in zip(master_names[targets], cand_names)], dtype=bool)
         nums_conflict &= ~kind_conflict
+        # シリーズ名: 両方にあって違う → 別商品 / 片方にだけある → 自動では確定しない
+        m_series = [series_in(n) for n in master_names[targets]]
+        c_series = [series_in(n) for n in cand_names]
+        series_conflict = np.array([bool(a) and bool(b) and a != b for a, b in zip(m_series, c_series)], dtype=bool)
+        series_conflict &= ~kind_conflict
+        nums_conflict &= ~series_conflict
+        disp = lambda ks: '・'.join(sorted(SERIES_DISPLAY.get(k, k) for k in ks))
+        series_only = np.array([disp(a ^ b) if (bool(a) != bool(b)) else '' for a, b in zip(m_series, c_series)], dtype=object)
 
         merged_df.loc[targets, '類似度'] = score_text
         merged_df.loc[targets, '一致方法'] = [f'一致なし (最高類似度: {s}%)' for s in score_text]
 
-        blocked = nums_conflict | kind_conflict
+        blocked = nums_conflict | kind_conflict | series_conflict
         ok = (best_score >= threshold) & nums_same & ~blocked
         demoted = (best_score >= threshold) & ~nums_same & ~blocked
         review = ~ok & ~blocked & (best_score >= review_threshold)
         conflict = nums_conflict & (best_score >= review_threshold)
         kuji = kind_conflict & (best_score >= review_threshold)
+        series_diff = series_conflict & (best_score >= review_threshold)
 
         # 要確認のうち、紛らわしさのないものは自動で確定する（相互最良一致）
         #   - 数字が一致し、類似度が AUTO_REVIEW_MIN 以上
@@ -321,7 +365,7 @@ def match_dataframes(df_master, df_price, threshold=MATCH_THRESHOLD, review_thre
         # 別の商品の可能性があるので自動では確定せず要確認にする（頭に作品名が余っているだけなら確定してよい）
         tails = np.array([extra_tail(mn, cn) if (o or a_) else ''
                           for mn, cn, o, a_ in zip(master_names[targets], cand_names, ok, auto)], dtype=object)
-        tail_hold = (ok | auto) & (tails != '')
+        tail_hold = (ok | auto) & ((tails != '') | (series_only != ''))
         ok &= ~tail_hold
         auto &= ~tail_hold
         review |= tail_hold
@@ -331,7 +375,7 @@ def match_dataframes(df_master, df_price, threshold=MATCH_THRESHOLD, review_thre
         #   - 候補がすでに別のマスター商品と一致済みなら、要確認に出さない
         #   - 候補から見てもっと近いマスター商品が他にあるなら、要確認はそちらだけに出す
         # 店側が作品名を省いているだけのもの（候補ごとに1件だけ当てはまるとき）は確定する
-        title = ~ok & ~auto & ~blocked & nums_same & np.array(
+        title = ~ok & ~auto & ~blocked & nums_same & (series_only == '') & np.array(
             [title_omitted_match(mn, cn) for mn, cn in zip(master_names[targets], cand_names)], dtype=bool)
         if title.any():
             per_cand = pd.Series(best_idx[title]).value_counts()
@@ -354,6 +398,10 @@ def match_dataframes(df_master, df_price, threshold=MATCH_THRESHOLD, review_thre
         merged_df.loc[targets[not_closest], '一致方法'] = [
             f'一致なし (候補にもっと近い商品が他にある: {c} / 類似度: {s}%)' for c, s in zip(cand_names[not_closest], score_text[not_closest])]
 
+        merged_df.loc[targets[series_diff], '一致方法'] = [
+            f'一致なし (シリーズ違い: {disp(a)} / {disp(b)} / 候補: {c} / 類似度: {s}%)'
+            for a, b, c, s in zip(np.array(m_series, dtype=object)[series_diff], np.array(c_series, dtype=object)[series_diff],
+                                  cand_names[series_diff], score_text[series_diff])]
         merged_df.loc[targets[kuji], '一致方法'] = [
             f'一致なし (くじ景品とプライズの違い: {c} / 類似度: {s}%)' for c, s in zip(cand_names[kuji], score_text[kuji])]
         merged_df.loc[targets[conflict], '一致方法'] = [
@@ -368,12 +416,13 @@ def match_dataframes(df_master, df_price, threshold=MATCH_THRESHOLD, review_thre
         # 要確認は確定させず、候補として別の列に出す
         merged_df.loc[targets[review], CANDIDATE_COL] = cand_names[review]
         merged_df.loc[targets[review], '一致方法'] = [
+            f'要確認 (片方にだけシリーズ名: {so}, 類似度: {s}%)' if so else
             f'要確認 (片方にだけ語が多い: {t}, 類似度: {s}%)' if t else
             f'要確認 (片方にだけ数字あり, 類似度: {s}%)' if d else f'要確認 (類似度: {s}%)'
-            for s, d, t in zip(score_text[review], demoted[review], tails[review])]
+            for s, d, t, so in zip(score_text[review], demoted[review], tails[review], series_only[review])]
 
         print(f"  あいまい一致: {ok.sum()}件 / 自動判定: {auto.sum()}件 / 作品名の省略: {auto_title.sum()}件 / 要確認: {review.sum()}件"
-              f" / 一致なし: {(~ok & ~auto & ~auto_title & ~review).sum()}件（うち数字が違う候補のみ {conflict.sum()}件、くじとプライズの違い {kuji.sum()}件、"
+              f" / 一致なし: {(~ok & ~auto & ~auto_title & ~review).sum()}件（うち数字が違う候補のみ {conflict.sum()}件、くじとプライズの違い {kuji.sum()}件、シリーズ違い {series_diff.sum()}件、"
               f"候補が一致済み {taken.sum()}件、候補にもっと近い商品あり {not_closest.sum()}件）")
 
     return merged_df
@@ -784,6 +833,9 @@ def execute_sheet_matching(master_sheet_id, price_sheet_id, threshold=MATCH_THRE
     print(f"買取価格表件数: {len(df_price)}件")
 
     jan_col, master_name_col, price_name_col = find_columns(df_master, df_price)
+    extra_series = [r[0] for r in read_tab(master_sh, SERIES_SHEET_NAME)[1:] if r and str(r[0]).strip()]
+    set_series_words(DEFAULT_SERIES_WORDS + extra_series)
+    print(f"シリーズ名: {len(SERIES_KEYS)}語（「{SERIES_SHEET_NAME}」タブから {len(extra_series)}語）")
     manual = load_manual(master_sh, jan_col, master_name_col)
 
     merged_df = match_dataframes(df_master, df_price, threshold, review_threshold, manual)
@@ -823,6 +875,9 @@ def execute_sheet_matching(master_sheet_id, price_sheet_id, threshold=MATCH_THRE
     current = write_compare(master_sh, merged_df, jan_col, master_name_col, stores)
     write_history(master_sh, current, [label for label, _, _ in stores])
     print("すべての処理が完了しました！")
+
+
+set_series_words(DEFAULT_SERIES_WORDS)
 
 
 if __name__ == "__main__":
