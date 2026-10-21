@@ -41,6 +41,8 @@ MAIN_LABEL = 'ドラゴンボーン'  # メインの価格表（PRICE_ID）の�
 # figure-kaitori-bot の形式（「現在一覧」タブ、状態=削除 の行は対象外）が基本。
 EXTRA_PRICE_SOURCES = [
     ('千葉鑑定団', 'CHIBAKAN_PRICE_ID', '現在一覧'),
+    # 東金店は買取表が画像なので、figure-kaitori-bot がGeminiでOCRしたものを同じ形式で書いている
+    ('千葉鑑定団東金', 'TOGANE_PRICE_ID', '現在一覧'),
     ('らしんばん', 'LASHINBANG_PRICE_ID', '現在一覧'),
     # twitter-rss-discord-bot の承認ダッシュボードが書く形式（ジャンル/商品名/価格/更新日/型番・JAN）。
     # ダッシュボードは「sheet1」タブに書く（最初のタブ「シート1」とは別に作られる）
