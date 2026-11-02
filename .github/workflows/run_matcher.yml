@@ -43,7 +43,7 @@ jobs:
           # twitter-rss-discord-bot のムーラン買取データのシート。未設定なら飛ばす
           MOULIN_PRICE_ID: ${{ secrets.MOULIN_PRICE_ID }}
           # figure-kaitori-bot のナカノファクトリーのシート（Xの「本日の商品」ポストから）。未設定なら飛ばす
-          NAKANO_PRICE_ID: ${{ secrets.NAKANO_PRICE_ID }}
+          NAKANO_PRICE_ID: ${{ secrets.NAKANO_PRICE_ID || '1PxxpiArkgRAo-Y7fsmpafSHabx66ShE4VR0aSOvsveU' }}
           MATCH_THRESHOLD: ${{ inputs.match_threshold || '95' }}
           REVIEW_THRESHOLD: ${{ inputs.review_threshold || '85' }}
         run: |
