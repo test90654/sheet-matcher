@@ -47,6 +47,8 @@ EXTRA_PRICE_SOURCES = [
     # twitter-rss-discord-bot の承認ダッシュボードが書く形式（ジャンル/商品名/価格/更新日/型番・JAN）。
     # ダッシュボードは「sheet1」タブに書く（最初のタブ「シート1」とは別に作られる）
     ('ムーラン', 'MOULIN_PRICE_ID', 'sheet1'),
+    # figure-kaitori-bot がナカノファクトリーのXの「本日の商品」ポストから書いている
+    ('ナカノファクトリー', 'NAKANO_PRICE_ID', '現在一覧'),
 ]
 EXTRA_PRICE_TAB = '現在一覧'
 
@@ -56,6 +58,9 @@ def extra_names(label):
     return f'{label}_{MANUAL_COL}', f'{MANUAL_SHEET_NAME}_{label}', f'{LIST_SHEET_NAME}_{label}'
 
 EXTRA_STATUS_COL = '状態'
+# 「最終確認日」がこの日数より古い行は、価格が古いので使わない（買取表の公開停止中など）。0 で無効
+CHECKED_COL = '最終確認日'
+STALE_DAYS = int(os.environ.get("STALE_DAYS", "7") or 0)
 EXTRA_REMOVED = '削除'
 UPDATED_COL = '更新日'
 WORK_COL = '作品名'
@@ -779,6 +784,16 @@ def load_price_df(gc, sheet_id, tab=EXTRA_PRICE_TAB, label=''):
     df.columns = df.columns.str.strip()
     if EXTRA_STATUS_COL in df.columns:
         df = df[df[EXTRA_STATUS_COL].astype(str).str.strip() != EXTRA_REMOVED]
+    if STALE_DAYS and CHECKED_COL in df.columns:
+        checked = pd.to_datetime(df[CHECKED_COL].astype(str).str.strip(), errors='coerce', format='mixed')
+        limit = pd.Timestamp(datetime.now(ZoneInfo('Asia/Tokyo')).date()) - pd.Timedelta(days=STALE_DAYS)
+        stale = checked.notna() & (checked < limit)
+        if stale.any():
+            latest = checked.max()
+            print(f"[{label}] 最終確認日が{STALE_DAYS}日より前の {stale.sum()}行を、価格が古いため除きました"
+                  f"（いちばん新しい確認日: {latest.date() if pd.notna(latest) else '不明'}）")
+            print(f"::warning::{label}: {stale.sum()} stale rows dropped (last checked {latest.date() if pd.notna(latest) else 'unknown'})")
+            df = df[~stale]
     # 作品名が別の列に分かれている表（ムーラン）は、作品名を商品名の前につなげて照合する
     name_col = next((c for c in df.columns if '商品名' in c), None)
     if name_col and WORK_COL in df.columns:
