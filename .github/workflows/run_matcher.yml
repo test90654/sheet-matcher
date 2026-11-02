@@ -3,6 +3,7 @@ name: Sheet Matcher Automation
 on:
   schedule:
     - cron: '0 23 * * *'  # 毎日日本時間 8:00
+    - cron: '30 4 * * *'  # 毎日日本時間 13:30（ナカノファクトリーの昼の投稿を反映するため）
   workflow_dispatch:
     inputs:
       match_threshold:
@@ -41,6 +42,8 @@ jobs:
           LASHINBANG_PRICE_ID: ${{ secrets.LASHINBANG_PRICE_ID }}
           # twitter-rss-discord-bot のムーラン買取データのシート。未設定なら飛ばす
           MOULIN_PRICE_ID: ${{ secrets.MOULIN_PRICE_ID }}
+          # figure-kaitori-bot のナカノファクトリーのシート（Xの「本日の商品」ポストから）。未設定なら飛ばす
+          NAKANO_PRICE_ID: ${{ secrets.NAKANO_PRICE_ID }}
           MATCH_THRESHOLD: ${{ inputs.match_threshold || '95' }}
           REVIEW_THRESHOLD: ${{ inputs.review_threshold || '85' }}
         run: |
